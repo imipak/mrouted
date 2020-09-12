@@ -5,10 +5,14 @@
 # Required-Stop:     $remote_fs $syslog
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
+# Short-Description: Multicast routing daemon, mrouted
+# Description:       The original dynamic multicast routing daemon, mrouted
 ### END INIT INFO
+. /lib/lsb/init-functions
 
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 DAEMON=/usr/sbin/mrouted
+STATUS=/usr/sbin/mroutectl
 NAME=mrouted
 DESC=mrouted
 
@@ -24,20 +28,22 @@ case "$1" in
                         --exec $DAEMON
                 echo "$NAME."
                 ;;
+
         stop)
                 echo -n "Stopping $DESC: "
                 start-stop-daemon --stop --quiet --oknodo --pidfile /var/run/$NAME.pid \
                         --exec $DAEMON
                 echo "$NAME."
                 ;;
+
         reload|force-reload)
                 echo -n "Reloading $DESC: "
                 start-stop-daemon --stop --signal 1 --quiet --pidfile /var/run/$NAME.pid \
                         --exec $DAEMON
                 echo "$NAME."
                 ;;
+
         restart)
-                
                 echo -n "Restarting $DESC: "
                 start-stop-daemon --stop --quiet --pidfile \
                         /var/run/$NAME.pid --exec $DAEMON
@@ -46,6 +52,11 @@ case "$1" in
                         /var/run/$NAME.pid --exec $DAEMON
                 echo "$NAME."
                 ;;
+
+	status)
+		$STATUS
+		;;
+
         *)
                 N=/etc/init.d/$NAME
                 echo "Usage: $N {start|stop|restart|reload|force-reload}" >&2

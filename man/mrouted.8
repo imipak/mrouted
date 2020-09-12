@@ -1,0 +1,251 @@
+.\"	$OpenBSD: mrouted.8,v 1.25 2014/09/08 01:27:55 schwarze Exp $
+.\" The mrouted program is covered by the license in the accompanying file
+.\" named "LICENSE".  Use of the mrouted program represents acceptance of
+.\" the terms and conditions listed in that file.
+.\"
+.\" The mrouted program is COPYRIGHT 1989 by The Board of Trustees of
+.\" Leland Stanford Junior University.
+.Dd Jun 9, 2020
+.Dt MROUTED 8 SMM
+.Os
+.Sh NAME
+.Nm mrouted
+.Nd IP multicast routing daemon
+.Sh SYNOPSIS
+.Nm mrouted
+.Op Fl hnsv
+.Op Fl d Ar SYS[,SYS,...
+.Op Fl f Ar FILE
+.Op Fl l Ar LEVEL
+.Op Fl w Ar SEC
+.Sh DESCRIPTION
+.Nm
+is the original implementation of the Distance-Vector Multicast Routing
+Protocol (DVMRP), RFC 1075.  A dynamic (automatic) multicast routing
+daemon.
+.Pp
+.Nm
+is
+.Em simple
+to use.  DVMRP is derived from RIP, RFC 1058, which means
+.Nm
+works stand-alone without any extra network setup required.  You can get
+up and running in a matter of minutes.
+.Pp
+.Nm
+maintains topological knowledge via DVMRP, upon which it implements a
+multicast datagram forwarding algorithm called Reverse Path
+Multicasting.
+.Pp
+.Nm
+forwards multicast datagrams along the shortest (reverse) path tree
+rooted at the subnet on which the datagram originates.  The multicast
+delivery tree may be thought of as a broadcast delivery tree that has
+been pruned back so that it does not extend beyond those subnetworks
+that have members of the destination group.  Hence, datagrams are not
+forwarded along those branches which have no listeners of the multicast
+group.  The IP time-to-live of a multicast datagram can be used to limit
+the range of multicast datagrams.
+.Pp
+In order to support multicasting among subnets that are separated by
+(unicast) routers that do not support IP multicasting, you can set up
+GRE tunnels.  However,
+.Nm
+includes (built-in) support for IP-in-IP tunnels, which are virtual
+point-to-point links between pairs of DVMRP capable rotuers located
+anywhere in an internet.  IP multicast packets are encapsulated for
+transmission through tunnels, so that they look like normal unicast
+datagrams to intervening routers and subnets.  The encapsulation is
+added on entry to a tunnel, and stripped off on exit from a tunnel.
+.Pp
+The tunneling mechanism allows
+.Nm
+to establish a virtual internet, for the purpose of multicasting only,
+which is independent of the physical internet, and which may span
+multiple Autonomous Systems.  This capability is intended for
+experimental support of internet multicasting only, pending widespread
+support for multicast routing by the regular (unicast) routers.
+.Nm
+suffers from the well-known scaling problems of any distance-vector
+routing protocol, and does not support hierarchical multicast routing.
+.Pp
+A more common practise today is to set up GRE tunnels between multicast
+capable routers and limit
+.Nm
+to run on a select number of interfaces listed in the configuration.
+.Pp
+.Nm
+handles multicast routing only; there may or may not be unicast routing
+software running on the same machine as
+.Nm mrouted .
+With the use of tunnels, it is not necessary for
+.Nm
+to have access to more than one physical subnet in order to perform
+multicast forwarding.
+.Pp
+.Sh OPTIONS
+This program follows the usual UNIX command line syntax, with long
+options starting with two dashes (`--').  The options are as follows:
+.Bl -tag -width Ds
+.It Fl d, -debug Ar SYS[,SYS,..]
+This option enables subsystem debug messages and causes
+.Nm
+to run in the foreground of the starting terminal, regardless of the
+.Fl l
+flag controls the (syslog) log level of each subsystem.  Use '?' for a
+complete list of supported subsystems.
+.Pp
+Available subystems:
+.Pp
+.Bl -tag -width TERM -compact -offset indent
+.It Cm packet | pkt
+Debug inbound/outbout packets
+.It Cm prunes | pruning
+Pruning operations, or pruned routes
+.It Cm routes | routing
+Routing messages
+.It Cm rtdetail | route-detail
+Detailed routing information
+.It Cm peers | neighbors
+Neighbor gossip
+.It Cm cache
+Debug routing cache
+.It Cm timer
+Debug
+.Nm
+timer handling
+.It Cm vif | interface
+Show interface (VIF) debug messages
+.It Cm groups | membership
+Debug group memberships
+.It Cm mtrace | traceroute
+Multicast traceroute information
+.It Cm igmp
+Debug IGMP messages
+.It Cm icmp
+Debug ICMP messages
+.It Cm rsrr
+Debug RSRR messages
+.It Cm all | 3
+Enable all debug messages
+.El
+.It Fl f, -config Ar FILE
+Specify an alternative configuration file, default
+.Pa /etc/mrouted.conf
+.It Fl h, -help
+Print a help message and exit.
+.It Fl l, -loglevel Ar LEVEL
+Set log level for syslog messages: none, err, notice (default), info,
+debug. Use '?' for a complete list of supported log levels.
+.Pp
+.Bl -tag -width WARNING -compact -offset indent
+.It Cm none
+Disable all logging
+.It Cm error
+Error conditions
+.It Cm warning
+Warning conditions
+.It Cm notice
+Normal but significant condition (default)
+.It Cm info
+Informational
+.It Cm debug
+Debug-level messages
+.El
+.It Fl n, -foreground
+Run in foreground, do not detach from controlling terminal.  This option
+is usually required when running under process supervisors like systemd
+and Finit, but is also useful when running from the terminal, when
+debugging a config or at initial set up.  Remember to also give the
+.Fl s
+option if you still want to redirect log messages to the syslog.
+.It Fl w, -startup-delay Ar SEC
+Wait for
+.Ar SEC
+seconds before applying routes.  This delay allows exchange of routes
+before starting to forward multicast packets.  In certain setups this
+can prevent transient problems at startup, at the cost of a momentary
+black hole.
+.It Fl s, -syslog
+Use
+.Xr syslog 3
+for log messages, warnings and error conditions.  This is the default
+when running in the background.  When running in the foreground, see
+.Fl n ,
+log messages are printed to stdout.
+.El
+.Pp
+.Sh SIGNALS
+.Nm
+responds to the following signals:
+.Pp
+.Bl -tag -width TERM -compact
+.It HUP
+Restart
+.Nm mrouted
+and reload the configuration file.
+.It INT
+Terminate execution gracefully, i.e., by sending good-bye messages to
+all neighboring routers.
+.It TERM
+Same as INT.
+.El
+.Pp
+For convenience,
+.Nm
+writes its process ID to
+.Pa /var/run/mrouted.pid
+when it has completed its start up and is ready to receive signals.
+.Sh FILES
+.Bl -tag -width /var/lib/mrouted.genid -compact
+.It Pa /etc/mrouted.conf
+Main configuration file.
+.It Pa /var/lib/mrouted.genid
+DVMRP generation ID.  Used by neighboring DVRMP routers to detect when a
+router is restarted.
+.It Pa /var/run/mrouted.pid
+Pidfile (re)created by
+.Nm
+daemon when it has started up and is ready to receive commands.
+.It Pa /var/run/mrouted.sock
+.Ux Ns -domain
+socket used for communication with
+.Xr mroutectl 8
+.It Pa /proc/net/ip_mr_cache
+Holds active IPv4 multicast routes (Linux).
+.It Pa /proc/net/ip_mr_vif
+Holds the IPv4 virtual interfaces used by the active multicast routing
+daemon (Linux).
+.El
+.Sh SEE ALSO
+.Xr mrouted.conf 5 ,
+.Xr mroutectl 8 ,
+.Xr map-mbone 8 ,
+.Xr mrinfo 8 ,
+.Xr mtrace 8 ,
+.Xr pimd 8 ,
+.Xr smcroute 8
+.Rs
+.%A S. Deering
+.%O Proceedings of the ACM SIGCOMM '88 Conference
+.%T Multicast Routing in Internetworks and Extended LANs
+.Re
+.Pp
+The
+.Nm mrouted
+home page is
+.Aq https://github.com/troglobit/mrouted
+.Sh AUTHORS
+The following are the principal authors of
+.Nm ,
+listed in no particular order:
+.Pp
+.An David Waitzman ,
+.An Craig Partridge ,
+.An Steve Deering ,
+.An Ajit Thyagarajan ,
+.An Bill Fenner ,
+.An David Thaler , and
+.An Daniel Zappala .
+.Pp
+With contributions by many others.
