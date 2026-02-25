@@ -22,15 +22,14 @@ struct debugnm debugnames[] = {
     {   "kernel",       DEBUG_KERN,     2       },
     {	"cache",	DEBUG_CACHE,	1	},
     {	"timer",	DEBUG_TIMEOUT,	2	},
-    {	"vif",		DEBUG_IF,	1	},
     {	"interface",	DEBUG_IF,	2	},
-    {	"groups",	DEBUG_MEMBER,	1	},
+    {	"vif",		DEBUG_IF,	1	},
     {	"membership",	DEBUG_MEMBER,	1	},
-    {	"mtrace",	DEBUG_TRACE,	2	},
+    {	"groups",	DEBUG_MEMBER,	1	},
     {	"traceroute",	DEBUG_TRACE,	2	},
+    {	"mtrace",	DEBUG_TRACE,	2	},
     {	"igmp",		DEBUG_IGMP,	1	},
     {	"icmp",		DEBUG_ICMP,	2	},
-    {	"rsrr",		DEBUG_RSRR,	2	},
     {	"all",		DEBUG_ALL,	1	},
     {	"3",		DEBUG_ALL,	1	}	/* compat. */
 };
@@ -38,12 +37,17 @@ struct debugnm debugnames[] = {
 int debug_list(int mask, char *buf, size_t len)
 {
     struct debugnm *d;
+    uint32_t last = 0;
     size_t i;
 
     memset(buf, 0, len);
     for (i = 0, d = debugnames; i < ARRAY_LEN(debugnames); i++, d++) {
 	if (!(mask & d->level))
 	    continue;
+
+	if (last == d->level)
+	    continue;
+	last = d->level;
 
 	if (mask != (int)DEBUG_ALL)
 	    mask &= ~d->level;
@@ -126,7 +130,6 @@ int debug_parse(char *arg)
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

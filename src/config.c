@@ -7,8 +7,215 @@
  * Leland Stanford Junior University.
  */
 
-#include "defs.h"
 #include <ifaddrs.h>
+#include "defs.h"
+
+static TAILQ_HEAD(, uvif) vifs = TAILQ_HEAD_INITIALIZER(vifs);
+
+void config_set_ifflag(uint32_t flag)
+{
+    struct uvif *uv;
+
+    TAILQ_FOREACH(uv, &vifs, uv_link)
+	uv->uv_flags |= flag;
+}
+
+struct uvif *config_find_ifname(char *nm)
+{
+    struct uvif *uv;
+
+    if (!nm) {
+	errno = EINVAL;
+	return NULL;
+    }
+
+    TAILQ_FOREACH(uv, &vifs, uv_link) {
+        if (!strcmp(uv->uv_name, nm))
+            return uv;
+    }
+
+    return NULL;
+}
+
+struct uvif *config_find_ifaddr(in_addr_t addr)
+{
+    struct uvif *uv;
+
+    TAILQ_FOREACH(uv, &vifs, uv_link) {
+	if (!(uv->uv_flags & VIFF_TUNNEL) && addr == uv->uv_lcl_addr)
+            return uv;
+    }
+
+    return NULL;
+}
+
+struct uvif *config_init_tunnel(in_addr_t lcl_addr, in_addr_t rmt_addr, uint32_t flags)
+{
+    const char *ifname;
+    struct ifreq ifr;
+    struct uvif *uv;
+
+    uv = config_find_ifaddr(lcl_addr);
+    if (!uv) {
+	errno = ENOTMINE;
+	return NULL;
+    }
+    ifname = uv->uv_name;
+
+    if (((ntohl(lcl_addr) & IN_CLASSA_NET) >> IN_CLASSA_NSHIFT) == IN_LOOPBACKNET) {
+	errno = ELOOPBACK;
+	return NULL;
+    }
+
+    if (config_find_ifaddr(rmt_addr)) {
+	errno = ERMTLOCAL;
+	return NULL;
+    }
+
+    TAILQ_FOREACH(uv, &vifs, uv_link) {
+	if (uv->uv_flags & VIFF_DISABLED)
+	    continue;
+
+	if (uv->uv_flags & VIFF_TUNNEL) {
+	    if (rmt_addr == uv->uv_rmt_addr) {
+		errno = EDUPLICATE;
+		return NULL;
+	    }
+
+	    continue;
+	}
+
+	if ((rmt_addr & uv->uv_subnetmask) == uv->uv_subnet) {
+	    logit(LOG_INFO, 0,
+		  "Unnecessary tunnel to %s, same subnet as interface %s",
+		  inet_fmt(rmt_addr, s1, sizeof(s1)), uv->uv_name);
+	    return NULL;
+	}
+    }
+
+    strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+    if (ioctl(udp_socket, SIOCGIFFLAGS, &ifr) < 0) {
+	logit(LOG_INFO, errno, "failed SIOCGIFFLAGS on %s", ifr.ifr_name);
+	return NULL;
+    }
+
+    uv = calloc(1, sizeof(struct uvif));
+    if (!uv) {
+	logit(LOG_ERR, errno, "failed allocating memory for iflist");
+	return NULL;
+    }
+
+    zero_vif(uv, 1);
+    uv->uv_flags      = VIFF_TUNNEL | flags;
+    uv->uv_flags     |= VIFF_OTUNNEL; /* XXX */
+    uv->uv_lcl_addr   = lcl_addr;
+    uv->uv_rmt_addr   = rmt_addr;
+    uv->uv_dst_addr   = rmt_addr;
+    strlcpy(uv->uv_name, ifr.ifr_name, sizeof(uv->uv_name));
+
+    uv->uv_ifindex = if_nametoindex(uv->uv_name);
+    if (!uv->uv_ifindex)
+	logit(LOG_ERR, errno, "Failed reading ifindex for %s", uv->uv_name);
+
+    if (!(ifr.ifr_flags & IFF_UP)) {
+	uv->uv_flags |= VIFF_DOWN;
+	vifs_down = TRUE;
+    }
+
+    TAILQ_INSERT_TAIL(&vifs, uv, uv_link);
+
+    return uv;
+}
+
+/*
+ * Ignore any kernel interface that is disabled, or connected to the
+ * same subnet as one already installed in the uvifs[] array.
+ */
+static vifi_t check_vif(struct uvif *v)
+{
+    struct uvif *uv;
+    vifi_t vifi;
+
+    UVIF_FOREACH(vifi, uv) {
+	if (v->uv_flags & VIFF_TUNNEL)
+	    continue;
+
+	if (v->uv_flags & VIFF_DISABLED) {
+	    logit(LOG_DEBUG, 0, "Skipping %s, disabled", v->uv_name);
+	    return NO_VIF;
+	}
+
+	if ((v->uv_lcl_addr & uv->uv_subnetmask) == uv->uv_subnet ||
+	    (uv->uv_subnet  &  v->uv_subnetmask) ==  v->uv_subnet) {
+	    logit(LOG_WARNING, 0, "ignoring %s, same subnet as %s",
+		  v->uv_name, uv->uv_name);
+	    return NO_VIF;
+	}
+
+	/*
+	 * Same interface, but cannot have multiple VIFs on the same
+	 * interface so add as secondary IP address (altnet) for RPF
+	 */
+	if (strcmp(v->uv_name, uv->uv_name) == 0) {
+	    struct phaddr *ph;
+
+	    ph = calloc(1, sizeof(*ph));
+	    if (!ph) {
+		logit(LOG_ERR, errno, "Failed allocating altnet on %s", uv->uv_name);
+		break;
+	    }
+
+	    logit(LOG_INFO, 0, "Installing %s subnet %s as an altnet on %s",
+		  v->uv_name,
+		  inet_fmts(v->uv_subnet, v->uv_subnetmask, s2, sizeof(s2)),
+		  uv->uv_name);
+
+	    ph->pa_subnet      = v->uv_subnet;
+	    ph->pa_subnetmask  = v->uv_subnetmask;
+	    ph->pa_subnetbcast = v->uv_subnetbcast;
+
+	    ph->pa_next = uv->uv_addrs;
+	    uv->uv_addrs = ph;
+	    return NO_VIF;
+	}
+    }
+
+    return vifi;
+}
+
+void config_vifs_correlate(void)
+{
+    struct listaddr *al, *al_tmp;
+    struct uvif *uv, *v, *tmp;
+    vifi_t vifi;
+
+    TAILQ_FOREACH_SAFE(v, &vifs, uv_link, tmp) {
+	vifi = check_vif(v);
+	if (vifi == NO_VIF || install_uvif(v)) {
+	    TAILQ_REMOVE(&vifs, v, uv_link);
+	    free(v);
+	    continue;
+	}
+
+	if (v->uv_flags & VIFF_TUNNEL)
+	    logit(LOG_INFO, 0, "Installing tunnel %s from %s to %s as VIF #%u, rate %d pps",
+		  v->uv_name, inet_fmt(v->uv_lcl_addr, s1, sizeof(s1)),
+		  inet_fmt(v->uv_rmt_addr, s2, sizeof(s2)),
+		  vifi, v->uv_rate_limit);
+	else
+	    logit(LOG_INFO, 0, "Installing %s (%s on subnet %s) as VIF #%u, rate %d pps",
+		  v->uv_name, inet_fmt(v->uv_lcl_addr, s1, sizeof(s1)),
+		  inet_fmts(v->uv_subnet, v->uv_subnetmask, s2, sizeof(s2)),
+		  vifi, v->uv_rate_limit);
+    }
+
+    /*
+     * XXX: one future extension may be to keep this for adding/removing
+     *      dynamic interfaces at runtime.  Now we re-init and let SIGHUP
+     *      rebuild it to recheck since we tear down all vifs anyway.
+     */
+    TAILQ_INIT(&vifs);
+}
 
 /*
  * Query the kernel to find network interfaces that are multicast-capable
@@ -16,10 +223,10 @@
  */
 void config_vifs_from_kernel(void)
 {
+    in_addr_t addr, mask, subnet;
     struct ifaddrs *ifa, *ifap;
-    register struct uvif *v;
-    register vifi_t vifi;
-    uint32_t addr, mask, subnet;
+    struct uvif *uv;
+    vifi_t vifi;
     int flags;
 
     if (getifaddrs(&ifap) < 0)
@@ -56,61 +263,41 @@ void config_vifs_from_kernel(void)
 	    continue;
 	}
 
-	/*
-	 * Ignore any interface that is connected to the same subnet as
-	 * one already installed in the uvifs array.
-	 */
-	for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v) {
-	    if (strcmp(v->uv_name, ifa->ifa_name) == 0) {
-		logit(LOG_DEBUG, 0, "skipping %s (%s on subnet %s) (alias for vif#%u?)",
-			v->uv_name, inet_fmt(addr, s1, sizeof(s1)),
-			inet_fmts(subnet, mask, s2, sizeof(s2)), vifi);
-		break;
-	    }
-	    if ((addr & v->uv_subnetmask) == v->uv_subnet ||
-		(v->uv_subnet & mask) == subnet) {
-		logit(LOG_WARNING, 0, "ignoring %s, same subnet as %s",
-		    ifa->ifa_name, v->uv_name);
-		break;
-	    }
-	}
+	uv = calloc(1, sizeof(struct uvif));
+        if (!uv) {
+            logit(LOG_ERR, errno, "failed allocating memory for iflist");
+            return;
+        }
 
-	if (vifi != numvifs)
-	    continue;
+	zero_vif(uv, 0);
+
+	strlcpy(uv->uv_name, ifa->ifa_name, sizeof(uv->uv_name));
+	uv->uv_lcl_addr    = addr;
+	uv->uv_subnet      = subnet;
+	uv->uv_subnetmask  = mask;
+	uv->uv_subnetbcast = subnet | ~mask;
+
+	if (ifa->ifa_flags & IFF_POINTOPOINT)
+	    uv->uv_flags |= VIFF_REXMIT_PRUNES;
 
 	/*
-	 * If there is room in the uvifs array, install this interface.
+	 * On Linux we can enumerate vifs using ifindex,
+	 * no need for an IP address.  Also used for the
+	 * VIF lookup in find_vif()
 	 */
-	if (numvifs == MAXVIFS) {
-	    logit(LOG_WARNING, 0, "too many vifs, ignoring %s", ifa->ifa_name);
-	    continue;
-	}
-
-	v  = &uvifs[numvifs];
-	zero_vif(v, 0);
-	v->uv_lcl_addr    = addr;
-	v->uv_subnet      = subnet;
-	v->uv_subnetmask  = mask;
-	v->uv_subnetbcast = subnet | ~mask;
-	memcpy(v->uv_name, ifa->ifa_name, sizeof(v->uv_name));
-
-	if (flags & IFF_POINTOPOINT)
-	    v->uv_flags |= VIFF_REXMIT_PRUNES;
-
-	logit(LOG_INFO, 0, "Installing %s (%s on subnet %s) as VIF #%u, rate %d pps",
-	      v->uv_name, inet_fmt(addr, s1, sizeof(s1)), inet_fmts(subnet, mask, s2, sizeof(s2)),
-	      numvifs, v->uv_rate_limit);
-
-	++numvifs;
-
+	uv->uv_ifindex = if_nametoindex(uv->uv_name);
+	if (!uv->uv_ifindex)
+	    logit(LOG_ERR, errno, "Failed reading ifindex for %s", uv->uv_name);
 	/*
 	 * If the interface is not yet up, set the vifs_down flag to
 	 * remind us to check again later.
 	 */
 	if (!(flags & IFF_UP)) {
-	    v->uv_flags |= VIFF_DOWN;
+	    uv->uv_flags |= VIFF_DOWN;
 	    vifs_down = TRUE;
 	}
+
+	TAILQ_INSERT_TAIL(&vifs, uv, uv_link);
     }
 
     freeifaddrs(ifap);
@@ -119,7 +306,6 @@ void config_vifs_from_kernel(void)
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

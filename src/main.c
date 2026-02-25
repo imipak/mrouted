@@ -23,55 +23,36 @@
 #include <fcntl.h>
 #include <poll.h>
 
-extern char *configfilename;
-
 int haveterminal = 1;
 int did_final_init = 0;
-
-static int sighandled = 0;
-#define	GOT_SIGINT	0x01
-#define	GOT_SIGHUP	0x02
-#define	GOT_SIGUSR1	0x04
-#define	GOT_SIGUSR2	0x08
 
 int cache_lifetime 	= DEFAULT_CACHE_LIFETIME;
 int prune_lifetime	= AVERAGE_PRUNE_LIFETIME;
 
 int startupdelay = 0;
+int mrt_table_id = 0;
 
 int debug = 0;
 int running = 1;
 int use_syslog = 1;
 time_t mrouted_init_time;
 
-#define NHANDLERS	2
-static struct ihandler {
-    int fd;			/* File descriptor	*/
-    ihfunc_t func;		/* Function to call	*/
-} ihandlers[NHANDLERS];
-static int nhandlers = 0;
+char *config_file = NULL;
+char *pid_file    = NULL;
+char *sock_file   = NULL;
+
+static char *ident = PACKAGE_NAME;
 
 /*
  * Forward declarations.
  */
-static void final_init(void *);
-static void fasttimer(void*);
-static void timer(void*);
-static void handle_signals(int);
-static int  check_signals(void);
-static int  timeout(int);
-static void cleanup(void);
+static void final_init     (int, void *);
+static void fasttimer      (int, void *);
+static void timer          (int, void *);
+static void handle_signals (int, void *);
+static int  timeout        (int);
+static void cleanup        (void);
 
-int register_input_handler(int fd, ihfunc_t func)
-{
-    if (nhandlers >= NHANDLERS)
-	return -1;
-
-    ihandlers[nhandlers].fd = fd;
-    ihandlers[nhandlers++].func = func;
-
-    return 0;
-}
 
 static void do_randomize(void)
 {
@@ -93,34 +74,64 @@ static void do_randomize(void)
    srandom(seed);
 }
 
-static FILE *fopen_genid(char *mode)
+/*
+ * _PATH_MROUTED_GENID is the configurable fallback and old default used
+ * by mrouted, which does not comply with FHS.  We only read that if it
+ * exists, otherwise we use the system _PATH_VARDB, which works on all
+ * *BSD and GLIBC based Linux systems.  Some Linux systms don't have the
+ * correct FHS /var/lib/misc for that define, so we check for that too.
+ */
+static FILE *fopen_genid(const char *mode)
 {
+    const char *path = _PATH_VARDB;
     char fn[80];
 
-    snprintf(fn, sizeof(fn), _PATH_MROUTED_GENID);
+    /* If old /var/lib/mrouted.genid exists, use that for compat. */
+    snprintf(fn, sizeof(fn), _PATH_MROUTED_GENID, ident);
+    if (access(fn, F_OK)) {
+#ifdef __linux__
+	/*
+	 * Workaround for Linux systems where _PATH_VARDB is /var/db but
+	 * the rootfs doesn't have it.  Let's check for /var/lib/misc
+	 */
+	if (access(path, W_OK))
+	    path = PRESERVEDIR "/misc";
+#endif
+	if (!access(path, W_OK))
+	    snprintf(fn, sizeof(fn), "%s/%s.genid", path, ident);
+    }
 
+    /* If all fails we fall back to try _PATH_MROUTED_GENID */
     return fopen(fn, mode);
 }
 
-static void init_gendid(void)
+static uint32_t rand_genid(void)
+{
+	struct timespec tv;
+
+	clock_gettime(CLOCK_MONOTONIC, &tv);
+
+	return (uint32_t)tv.tv_sec;	/* for a while after 2038 */
+}
+
+static void init_genid(void)
 {
     FILE *fp;
 
     fp = fopen_genid("r");
-    if (!fp) {
-	struct timespec tv;
-
-	clock_gettime(CLOCK_MONOTONIC, &tv);
-	dvmrp_genid = (uint32_t)tv.tv_sec;	/* for a while after 2038 */
-    } else {
+    if (fp) {
 	uint32_t prev_genid;
 	int ret;
 
 	ret = fscanf(fp, "%u", &prev_genid);
-	if (ret == 1 && prev_genid == dvmrp_genid)
-	    dvmrp_genid++;
 	(void)fclose(fp);
-    }
+
+	if (ret == 1)
+	    dvmrp_genid = prev_genid + 1;
+	else
+	    dvmrp_genid = rand_genid();
+    } else
+	dvmrp_genid = rand_genid();
 
     fp = fopen_genid("w");
     if (fp) {
@@ -129,16 +140,46 @@ static void init_gendid(void)
     }
 }
 
+static int compose_paths(void)
+{
+    /* Default .conf file path: "/etc" + '/' + "pimd" + ".conf" */
+    if (!config_file) {
+	size_t len = strlen(SYSCONFDIR) + strlen(ident) + 7;
+
+	config_file = malloc(len);
+	if (!config_file) {
+	    logit(LOG_ERR, errno, "Failed allocating memory, exiting.");
+	    exit(1);
+	}
+
+	snprintf(config_file, len, _PATH_MROUTED_CONF, ident);
+    }
+
+    /* Default is to let pidfile() API construct PID file from ident */
+    if (!pid_file)
+	pid_file = strdup(ident);
+
+    return 0;
+}
+
 static int usage(int code)
 {
-    printf("Usage: mrouted [-himnpsv] [-f FILE] [-d SYS[,SYS...]] [-l LEVEL]\n"
+    printf("Usage: mrouted [-himnpsv] [-f FILE] [-i NAME] [-d SYS[,SYS...]] [-l LEVEL]\n"
+	   "                          [-p FILE] [-u FILE] [-w SEC]\n"
 	   "\n"
 	   "  -d, --debug=SYS[,SYS]    Debug subsystem(s), see below for valid system names\n"
 	   "  -f, --config=FILE        Configuration file to use, default /etc/mrouted.conf\n"
 	   "  -h, --help               Show this help text\n"
+	   "  -i, --ident=NAME         Identity for syslog, .cfg & .pid file, default: mrouted\n"
 	   "  -l, --loglevel=LEVEL     Set log level: none, err, notice (default), info, debug\n"
 	   "  -n, --foreground         Run in foreground, do not detach from controlling terminal\n"
+	   "  -p, --pidfile=FILE       File to store process ID for signaling daemon\n"
 	   "  -s, --syslog             Log to syslog, default unless running in --foreground\n"
+#ifdef __linux__
+	   "  -t, --table-id=ID        Set multicast routing table ID.  Allowed table ID#:\n"
+	   "                           0 .. 999999999.  Default: 0 (use default table)\n"
+#endif
+	   "  -u, --ipc=FILE           Override UNIX domain socket, default from identity, -i\n"
 	   "  -v, --version            Show mrouted version\n"
 	   "  -w, --startup-delay=SEC  Startup delay before forwarding\n");
 
@@ -155,24 +196,54 @@ static int usage(int code)
 
 int main(int argc, char *argv[])
 {
-    FILE *fp;
-    int foreground = 0;
-    int vers, n = -1, i, ch;
-    struct pollfd *pfd;
-    struct sigaction sa;
     struct option long_options[] = {
-	{ "config",        1, 0, 'f' },
 	{ "debug",         2, 0, 'd' },
-	{ "foreground",    0, 0, 'n' },
+	{ "config",        1, 0, 'f' },
 	{ "help",          0, 0, 'h' },
+	{ "ident",         1, 0, 'i' },
 	{ "loglevel",      1, 0, 'l' },
+	{ "foreground",    0, 0, 'n' },
+	{ "pidfile",       1, 0, 'p' },
+	{ "syslog",        0, 0, 's' },
+#ifdef __linux__
+	{ "table-id",      1, 0, 't' },
+#endif
+	{ "ipc",           1, 0, 'u' },
 	{ "version",       0, 0, 'v' },
 	{ "startup-delay", 1, 0, 'w' },
 	{ NULL, 0, 0, 0 }
     };
+    int foreground = 0;
+    int vers, ch;
 
-    while ((ch = getopt_long(argc, argv, "d:f:hl:nsvw:", long_options, NULL)) != EOF) {
+    while ((ch = getopt_long(argc, argv, "d:f:hi:l:np:st:u:vw:", long_options, NULL)) != EOF) {
+#ifdef __linux__
+	const char *errstr = NULL;
+#endif
+
 	switch (ch) {
+	    case 'd':
+		if (!strcmp(optarg, "?")) {
+		    debug_print();
+		    return 0;
+		}
+
+		debug = debug_parse(optarg);
+		if ((int)DEBUG_PARSE_ERR == debug)
+		    return usage(1);
+		break;
+
+	    case 'f':
+		config_file = optarg;
+		break;
+
+	    case 'h':
+		return usage(0);
+
+	    case 'i':	/* --ident=NAME */
+		ident = optarg;
+		break;
+
 	    case 'l':
 		if (!strcmp(optarg, "?")) {
 		    char buf[128];
@@ -186,31 +257,32 @@ int main(int argc, char *argv[])
 		    return usage(1);
 		break;
 
-	    case 'f':
-		configfilename = optarg;
-		break;
-
-	    case 'd':
-		if (!strcmp(optarg, "?")) {
-		    debug_print();
-		    return 0;
-		}
-
-		debug = debug_parse(optarg);
-		if ((int)DEBUG_PARSE_ERR == debug)
-		    return usage(1);
-		break;
-
 	    case 'n':
 		foreground = 1;
 		use_syslog--;
 		break;
-
-	    case 'h':
-		return usage(0);
+	    case 'p':	/* --pidfile=NAME */
+		pid_file = strdup(optarg);
+		break;
 
 	    case 's':	/* --syslog */
 		use_syslog++;
+		break;
+
+	    case 't':
+#ifndef __linux__
+		errx(1, "-t ID is currently only supported on Linux");
+#else
+		mrt_table_id = strtonum(optarg, 0, 999999999, &errstr);
+		if (errstr) {
+		    fprintf(stderr, "Table ID %s!\n", errstr);
+		    return usage(1);
+		}
+#endif
+		break;
+
+	    case 'u':
+		sock_file = strdup(optarg);
 		break;
 
 	    case 'v':
@@ -232,9 +304,11 @@ int main(int argc, char *argv[])
 	return usage(1);
 
     if (geteuid() != 0) {
-	fprintf(stderr, "%s: must be root\n", PACKAGE_NAME);
+	fprintf(stderr, "%s: must be root\n", ident);
 	exit(1);
     }
+
+    compose_paths();
     setlinebuf(stderr);
 
     if (debug != 0) {
@@ -244,10 +318,38 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "debug level 0x%x (%s)\n", debug, buf);
     }
 
+    if (!debug && !foreground) {
+#ifdef TIOCNOTTY
+	int fd;
+#endif
+
+	/* Detach from the terminal */
+	haveterminal = 0;
+	if (fork())
+	    exit(0);
+
+	(void)close(0);
+	(void)close(1);
+	(void)close(2);
+	(void)open("/dev/null", O_RDONLY);
+	(void)dup2(0, 1);
+	(void)dup2(0, 2);
+#ifdef TIOCNOTTY
+	fd = open("/dev/tty", O_RDWR);
+	if (fd >= 0) {
+	    (void)ioctl(fd, TIOCNOTTY, NULL);
+	    (void)close(fd);
+	}
+#else
+	if (setsid() < 0)
+	    perror("setsid");
+#endif
+    }
+
     /*
      * Setup logging
      */
-    log_init();
+    log_init(ident);
     logit(LOG_DEBUG, 0, "%s starting", versionstring);
 
     do_randomize();
@@ -255,10 +357,11 @@ int main(int argc, char *argv[])
     /*
      * Get generation id
      */
-    init_gendid();
+    init_genid();
 
-    timer_init();
+    pev_init();
     igmp_init();
+
     init_icmp();
     init_ipip();
     init_routes();
@@ -283,65 +386,16 @@ int main(int argc, char *argv[])
 	      (vers >> 8) & 0xff, vers & 0xff, PROTOCOL_VERSION, MROUTED_VERSION);
 
     init_vifs();
-    ipc_init();
-#ifdef RSRR
-    rsrr_init();
-#endif
+    ipc_init(sock_file, ident);
 
-    sa.sa_handler = handle_signals;
-    sa.sa_flags = 0;	/* Interrupt system calls */
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
+    pev_timer_add(0, 1000000, fasttimer, NULL);
+    pev_timer_add(0, TIMER_INTERVAL * 1000000, timer, NULL);
 
-    pfd = calloc(sizeof(struct pollfd), 1 + nhandlers);
-    if (!pfd)
-	err(1, "Failed allocating internal memory");
-
-    pfd[0].fd = igmp_socket;
-    pfd[0].events = POLLIN;
-    for (i = 0; i < nhandlers; i++) {
-	pfd[i + 1].fd = ihandlers[i].fd;
-	pfd[i + 1].events = POLLIN;
-    }
-
-    /* schedule first timer interrupt */
-    timer_set(1, fasttimer, NULL);
-    timer_set(TIMER_INTERVAL, timer, NULL);
-
-    if (!debug && !foreground) {
-#ifdef TIOCNOTTY
-	int fd;
-#endif
-
-	/* Detach from the terminal */
-	haveterminal = 0;
-	if (fork())
-	    exit(0);
-
-	(void)close(0);
-	(void)close(1);
-	(void)close(2);
-	(void)open("/dev/null", O_RDONLY);
-	(void)dup2(0, 1);
-	(void)dup2(0, 2);
-#ifdef TIOCNOTTY
-	fd = open("/dev/tty", O_RDWR);
-	if (fd >= 0) {
-	    (void)ioctl(fd, TIOCNOTTY, (char *)0);
-	    (void)close(fd);
-	}
-#else
-	if (setsid() < 0)
-	    perror("setsid");
-#endif
-    }
-
-    if (pidfile(NULL))
-	warn("Cannot create pidfile");
+    pev_sig_add(SIGHUP,  handle_signals, NULL);
+    pev_sig_add(SIGINT,  handle_signals, NULL);
+    pev_sig_add(SIGTERM, handle_signals, NULL);
+    pev_sig_add(SIGUSR1, handle_signals, NULL);
+    pev_sig_add(SIGUSR2, handle_signals, NULL);
 
     /* XXX HACK
      * This will cause black holes for the first few seconds after startup,
@@ -354,58 +408,31 @@ int main(int argc, char *argv[])
      * turning on DVMRP.
      */
     if (startupdelay > 0)
-	timer_set(startupdelay, final_init, NULL);
+	pev_timer_add(startupdelay * 1000000, 0, final_init, NULL);
     else
-	final_init(NULL);
+	final_init(0, NULL);
 
-    /*
-     * Main receive loop.
-     */
-    while (running) {
-	if (check_signals())
-	    break;
+    /* Signal world we are now ready to start taking calls */
+    if (pidfile(pid_file))
+	logit(LOG_WARNING, errno, "Cannot create pidfile");
 
-	n = poll(pfd, nhandlers + 1, timeout(n) * 1000);
-	if (n < 0) {
-	    if (errno != EINTR)
-		logit(LOG_WARNING, errno, "poll failed");
-	    continue;
-	}
-
-	if (n > 0) {
-	    if (pfd[0].revents & POLLIN) {
-		ssize_t len;
-
-		len = recv(igmp_socket, recv_buf, RECV_BUF_SIZE, 0);
-		if (len < 0) {
-		    if (errno != EINTR)
-			logit(LOG_ERR, errno, "recvfrom");
-		    continue;
-		}
-		accept_igmp(len);
-	    }
-
-	    for (i = 0; i < nhandlers; i++) {
-		if (pfd[i + 1].revents & POLLIN)
-		    (*ihandlers[i].func)(ihandlers[i].fd);
-	    }
-	}
-    }
+    pev_run();
 
     logit(LOG_NOTICE, 0, "%s exiting", versionstring);
-    free(pfd);
     cleanup();
 
     return 0;
 }
 
-static void final_init(void *i)
+static void final_init(int id, void *arg)
 {
-    char *s = (char *)i;
+    char *s = (char *)arg;
 
     logit(LOG_NOTICE, 0, "%s%s", versionstring, s ? s : "");
     if (s)
 	free(s);
+    if (id > 0)
+	pev_timer_del(id);
 
     k_init_dvmrp();		/* enable DVMRP routing in kernel */
 
@@ -426,7 +453,7 @@ static void final_init(void *i)
  * seconds.  Also, every TIMER_INTERVAL seconds it calls timer() to
  * do all the other time-based processing.
  */
-static void fasttimer(void *arg)
+static void fasttimer(int id, void *arg)
 {
     static unsigned int tlast;
     static unsigned int nsent;
@@ -459,8 +486,6 @@ static void fasttimer(void *arg)
 
 	tlast = t;
     }
-
-    timer_set(1, fasttimer, NULL);
 }
 
 /*
@@ -487,12 +512,10 @@ uint32_t virtual_time = 0;
  * group querying duties, and drives various timers in routing entries and
  * virtual interface data structures.
  */
-static void timer(void *arg)
+static void timer(int id, void *arg)
 {
-    timer_set(TIMER_INTERVAL, timer, NULL);
-
-    age_routes();	/* Advance the timers in the route entries     */
-    age_vifs();		/* Advance the timers for neighbors */
+    age_routes();	/* Advance the timers in the route entries  */
+    age_vifs();		/* Advance the timers for neighbors         */
     age_table_entry();	/* Advance the timers for the cache entries */
 
     delay_change_reports = FALSE;
@@ -508,66 +531,7 @@ static void timer(void *arg)
     /*
      * Advance virtual time
      */
-    virtual_time += TIMER_INTERVAL;
-}
-
-/*
- * Handle timeout queue.
- *
- * If poll() + packet processing took more than 1 second, or if there is
- * a timeout pending, age the timeout queue.  If not, collect usec in
- * difftime to make sure that the time doesn't drift too badly.
- *
- * XXX: If the timeout handlers took more than 1 second, age the timeout
- * queue again.  Note, this introduces the potential for infinite loops!
- */
-static int timeout(int n)
-{
-    static struct timespec difftime, curtime, lasttime;
-    static int init = 1, secs = 0;
-
-    /* Age queue */
-    do {
-	/*
-	 * If poll() timed out, then there's no other activity to
-	 * account for and we don't need to call clock_gettime().
-	 */
-	if (n == 0) {
-	    curtime.tv_sec = lasttime.tv_sec + secs;
-	    curtime.tv_nsec = lasttime.tv_nsec;
-	    n = -1; /* don't do this next time through the loop */
-	} else {
-	    clock_gettime(CLOCK_MONOTONIC, &curtime);
-	    if (init) {
-		init = 0;	/* First time only */
-		lasttime = curtime;
-		difftime.tv_nsec = 0;
-	    }
-	}
-
-	difftime.tv_sec = curtime.tv_sec - lasttime.tv_sec;
-	difftime.tv_nsec += curtime.tv_nsec - lasttime.tv_nsec;
-	while (difftime.tv_nsec > 1000000000) {
-	    difftime.tv_sec++;
-	    difftime.tv_nsec -= 1000000000;
-	}
-
-	if (difftime.tv_nsec < 0) {
-	    difftime.tv_sec--;
-	    difftime.tv_nsec += 1000000000;
-	}
-	lasttime = curtime;
-
-	if (secs == 0 || difftime.tv_sec > 0)
-	    timer_age_queue(difftime.tv_sec);
-
-	secs = -1;
-    } while (difftime.tv_sec > 0);
-
-    /* Next timer to wait for */
-    secs = timer_next_delay();
-
-    return secs;
+    virtual_time += pev_timer_get(id) / 1000000;
 }
 
 static void cleanup(void)
@@ -576,9 +540,6 @@ static void cleanup(void)
 
     if (!in_cleanup) {
 	in_cleanup++;
-#ifdef RSRR
-	rsrr_clean();
-#endif
 	expire_all_routes();
 	report_to_all_neighbors(ALL_ROUTES);
 
@@ -590,7 +551,6 @@ static void cleanup(void)
 	    k_stop_dvmrp();
 	close(udp_socket);
 
-	timer_exit();
 	igmp_exit();
     }
 }
@@ -599,54 +559,26 @@ static void cleanup(void)
  * Signal handler.  Take note of the fact that the signal arrived
  * so that the main loop can take care of it.
  */
-static void handle_signals(int sig)
+static void handle_signals(int sig, void *arg)
 {
     switch (sig) {
-	case SIGINT:
-	case SIGTERM:
-	    sighandled |= GOT_SIGINT;
-	    break;
+    case SIGINT:
+    case SIGTERM:
+	pev_exit(0);
+	break;
 
-	case SIGHUP:
-	    sighandled |= GOT_SIGHUP;
-	    break;
-
-	case SIGUSR1:
-	    sighandled |= GOT_SIGUSR1;
-	    break;
-
-	case SIGUSR2:
-	    sighandled |= GOT_SIGUSR2;
-	    break;
-    }
-}
-
-static int check_signals(void)
-{
-    if (!sighandled)
-	return 0;
-
-    if (sighandled & GOT_SIGINT) {
-	sighandled &= ~GOT_SIGINT;
-	return 1;
-    }
-
-    if (sighandled & GOT_SIGHUP) {
-	sighandled &= ~GOT_SIGHUP;
+    case SIGHUP:
 	restart();
-    }
+	break;
 
-    if (sighandled & GOT_SIGUSR1) {
-	sighandled &= ~GOT_SIGUSR1;
+    case SIGUSR1:
 	logit(LOG_INFO, 0, "SIGUSR1 is no longer supported, use mroutectl instead.");
-    }
+	break;
 
-    if (sighandled & GOT_SIGUSR2) {
-	sighandled &= ~GOT_SIGUSR2;
+    case SIGUSR2:
 	logit(LOG_INFO, 0, "SIGUSR2 is no longer supported, use mroutectl instead.");
+	break;
     }
-
-    return 0;
 }
 
 /*
@@ -654,7 +586,6 @@ static int check_signals(void)
  */
 void restart(void)
 {
-    FILE *fp;
     char *s;
 
     s = strdup (" restart");
@@ -666,28 +597,28 @@ void restart(void)
      */
     free_all_prunes();
     free_all_routes();
-    timer_stop_all();
     stop_all_vifs();
     k_stop_dvmrp();
     igmp_exit();
+#ifndef IOCTL_OK_ON_RAW_SOCKET
     close(udp_socket);
+#endif
     did_final_init = 0;
 
     /*
      * start processing again
      */
-    init_gendid();
+    init_genid();
 
     igmp_init();
     init_routes();
     init_ktable();
     init_vifs();
     /*XXX Schedule final_init() as main does? */
-    final_init(s);
+    final_init(0, s);
 
-    /* schedule timer interrupts */
-    timer_set(1, fasttimer, NULL);
-    timer_set(TIMER_INTERVAL, timer, NULL);
+    /* Touch PID file to acknowledge SIGHUP */
+    pidfile(pid_file);
 }
 
 #define SCALETIMEBUFLEN 27
@@ -704,7 +635,8 @@ char *scaletime(time_t t)
     else
 	buf = buf1;
 
-    snprintf(p, SCALETIMEBUFLEN, "%2ld:%02ld:%02ld", t / 3600, (t % 3600) / 60, t % 60);
+    snprintf(p, SCALETIMEBUFLEN, "%2d:%02d:%02d", (int)(t / 3600),
+	     (int)((t % 3600) / 60), (int)(t % 60));
 
     return p;
 }
@@ -712,7 +644,6 @@ char *scaletime(time_t t)
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

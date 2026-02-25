@@ -5,7 +5,7 @@
 .\"
 .\" The mrouted program is COPYRIGHT 1989 by The Board of Trustees of
 .\" Leland Stanford Junior University.
-.Dd Jun 9, 2020
+.Dd Jan 1, 2021
 .Dt MROUTED.CONF 5
 .Os
 .Sh NAME
@@ -32,7 +32,7 @@ is likely better replaced by more direct (GRE) tunnels (i.e. eliminate
 the middle man).
 .El
 .Pp
-To override the default settings, for example to to add tunnel links to
+To override the default settings, for example to add tunnel links to
 other DVMRP routers, configuration commands may be placed in
 .Pa /etc/mrouted.conf .
 The file format is free-form: whitespace (including newlines) is not
@@ -44,10 +44,53 @@ character marks start of a comment to end of line.
 This setting defines the time in seconds that a cached multicast route
 stays in kernel before timing out.  The value of this entry should lie
 between 300 (5 min) and 86400 (1 day).  It defaults to 300.
-.It Cm name Ar boundary-name | scoped-addr Ns / Ns Ar mask-len
+.It Cm prune-lifetime Ar <120-86400>
+The average lifetime in seconds of prunes sent towards parents.  The
+actual lifetimes are randomized in the range [.5secs, 1.5secs].  Smaller
+values cause less state to be kept both at this router and the parent,
+at the cost of more frequent broadcasts.  However, some routers (e.g.
+mrouted <3.3 and all currently known versions of Cisco's IOS) do not use
+the DVMRP generation ID to determine that a neighbor has rebooted.
+Prunes sent towards these neighbors should be kept short, in order to
+shorten the time to recover from a reboot.  For use in this situation,
+the
+.Cm prune-lifetime
+keyword may be specified on an interface as described below.  It
+defaults to 7200.
+.It Cm name Ar boundary-name scoped-addr Ns / Ns Ar mask-len
 The
 .Cm name
-option assigns names to boundaries to make configuration easier.
+option assigns names to boundaries to make configuration per
+interface/tunnel easier.
+.It Cm noflood
+.Nm mrouted
+uses a DVMRP optimization to prevent having to keep individual routing
+tables for each neighbor; part of this optimization is that
+.Nm mrouted
+assumes that it is the forwarder for each of its attached subnets on
+startup.  This can cause duplicates for a short period (approximately
+one full route report interval), since both the router that just started
+up and the proper forwarder will be forwarding traffic.  This behavior
+can be turned off with the
+.Cm noflood
+keyword;
+.Nm mrouted
+will not assume that it is the forwarder on startup.  Turning on
+.Cm noflood
+can cause black holes on restart, which generally lasts approximately
+one full route report interval.
+.Pp
+The
+.Cm noflood
+keyword can also be specified on individual interfaces.
+.It Cm rexmit-prunes Op Ar on | off
+The default is to retransmit prunes on all point-to-point interfaces
+(including tunnels) but no multi-access interfaces.  This option may be
+used to make the default on (or off) for all interfaces.
+.Pp
+The
+.Cm rexmit-prunes
+keyword can also be specified on individual interfaces.
 .It Cm no router-alert
 Some multicast routers, and some IGMP snooping switches, do not support
 IP options like Router Alert, which is enabled in
@@ -57,35 +100,73 @@ setting,
 .Nm mrouted
 always calculates the IP payload offset based on the IP header length
 value of ingressing DVMRP and IGMP frames.
+.It Cm router-timeout Ar <1-1024>
+Known in the RFC as Other Querier Present Interval, controls the timer
+used to detect when an elected IGMP querier stops sending queries.  When
+the timer expires,
+.Nm mrouted
+will assume the role as querier.  The default is calculated based on the
+.Cm igmp-robustness
+value, see below.  Setting this to any value overrides the RFC
+algorithm, which may be necessary in some scenarios.
+.Pp
+.Sy Note:
+it is strongly recommended to leave this setting commented out.  Use the
+.Cm igmp-robustness
+setting to tweak behavior instead.
 .It Cm igmp-query-interval Ar <1-1024>
 This setting controls the IGMP query interval in seconds, used when this
-router is elected querier on a LAN.  It is not recommended to go below
-10 sec.  Default: 125.
+router is elected querier on a LAN.  The query interval on all eligable
+IGMP queriers on a LAN must be the same.  Default: 125.
+.Pp
+.Sy Note:
+this value must be greater than the
+.Cm igmp-query-response-interval .
+.It Cm igmp-query-response-interval Ar <1-1024>
+Controls the Max Resp Code in IGMP queries, which encodes the maximum
+time allowed before responding to a query.  Can be used to control the
+burstiness of IGMP/MLD traffic, a lower value causes burstier traffic.
+Default 10 sec.
+.Pp
+.Sy Note:
+this value must always be less than the
+.Cm igmp-query-interval .
+.It Cm igmp-query-last-member-interval Ar <1-1024>
+This setting controls the maximum time in seconds between group specific
+IGMP queries.  These are sent as response to a host on a LAN requesting
+to leave a multicast group.  The purpose is to double-check that there
+is no other host on the LAN that still wants the group.  Default: 1.
+.Pp
+See also
+.Cm igmp-robustness
+(below), which controls how many group-specific queries are sent.
 .It Cm igmp-robustness Ar <2-10>
-This setting controls many aspects of IGMP timers, for end devices and
-routers alike.  The
-.Cm query-response-interval
-used below is hard-coded to 10 sec in
-.Nm mrouted :
+The robustness setting controls many aspects of IGMP timers, for end
+devices and routers alike.  Default 2.
 .Pp
 .Bl -tag -indent
 .It Group Membership Timeout
 Number of seconds before
 .Nm mrouted
 determines that there are no more members of a group on a LAN.  Formula:
-(igmp-robustness x igmp-query-interval) + (1 x query-response-interval)
-.It Other Querier Timeout
+.Bd -literal -offset indent
+robustness x query-interval + query-response-interval
+.Ed
+.It Other Querier Present Interval
 Number of seconds before
 .Nm mrouted
-determines there is no longer an elected querier on the LAN.  Formula:
-(igmp-robustness x igmp-query-interval) + (0.5 x query-response-interval)
-.It Last-member Query Count
+determines there is no longer an elected querier on the LAN.  See also
+.Cm router-timeout .
+Formula:
+.Bd -literal -offset indent
+robustness x query-interval + query-response-interval / 2
+.Ed
+.It Last Member Query Count
 Number of group-specific queries sent before
 .Nm mrouted
-assumes there are no local members of a group.  The number of queries is
-equal to the value of the robustness variable.  However,
-.Nm mrouted
-currently hard-codes this to 2
+assumes there are no further local members of a group on the LAN.  The
+number of group-specific queries is equal to the value of the robustness
+variable.
 .El
 .It Cm no phyint 
 By default all interfaces are enabled.  This command disables all
@@ -103,12 +184,12 @@ phyint eth12 enable
 .Sy Note:
 Most UNIX kernels, including Linux, have a hard coded limit of 32 VIFs.
 In non-trivial setups this limit is often reached, causing weird errors
-that can be hard to debug.  The recommendation for those cases is to
-disable all phyint (this setting), and then selectively enable only the
-ones needed.
-.It Cm phyint Ar <local-addr | ifname> Oo Cm disable | enable Oc Oo Cm igmpv1 | igmpv2 | igmpv3 Oc Oo Cm altnet Ar network Ns / Ns Ar mask-len Oc Oo Cm boundary Ar boundary-name | scoped-addr Ns / Ns Ar mask-len Oc Oo Cm metric Ar <1-31> Oc Oo Cm rate-limit Ar kbps Oc Oo Cm threshold Ar ttl Oc
+that can be difficuly to debug.  The recommendation for those cases is
+to disable all phyint (this setting), and then selectively enable only
+the ones needed.
+.It Cm phyint Ar <local-addr | ifname> Oo Cm disable | enable Oc Oo Cm passive Oc Oo Cm blaster Oc Oo Cm force-leaf Oc Oo Cm noflood Oc Oo Cm igmpv1 | igmpv2 | igmpv3 Oc Oo Cm static-group Ar group Oc Oo Cm altnet Ar network Ns / Ns Ar mask-len Oc Oo Cm boundary Ar boundary-name | scoped-addr Ns / Ns Ar mask-len Oc Oo Cm metric Ar <1-31> Oc Oo Cm advert-metric Ar <0-31> Oc Oo Cm prune-lifetime Ar sec Oc Oo Cm rexmit-prunes Oo Ar on | off Oc Oc Oo Cm allow-nonpruners Oc Oo Cm notransit Oc Oo Cm accept|deny Po Ar route Ns / Ns Ar mask-len Oo Cm exact Oc Pc Ns + Oo Cm bidir Oc Oc Oo Cm rate-limit Ar kbps Oc Oo Cm threshold Ar ttl Oc
 .Pp
-This setting selects and alters properties of the phyiscal interfaces
+This setting selects and alters properties of the physical interfaces
 .Nm mrouted
 operates on.  Interfaces can be identified using their local IP address
 or their name.
@@ -122,30 +203,170 @@ commands must precede tunnel commands.
 .It Cm disable | enable
 Selectively disable or enable this interface.  Only enabled interfaces
 get a VIF in the kernel.
-.It Cm igmpv1 | igmpv2
+.It Cm beside Op on | off
+This is a tunnel option.  For compatibility with older
+.Nm mrouted
+routers the default is to unicast control traffic "beside" the tunnel.
+To encapsulate all control traffic inside the tunnel use
+.Cm beside Ar off .
+.It Cm igmpv1 | igmpv2 | igmpv3
 .Nm mrouted
 supports all IGMP versions.  Use these flags to force compatibility
 modes on the given interface.  Default:
 .Cm igmpv3
-.It Cm altnet
+.It Cm static-group Ar group
+This setting makes
+.Nm mrouted
+behave as if an IGMPv2 join for
+.Ar group
+was received on the
+.Cm phyint .
+Useful when there is no IGMP capable hosts on the LAN, or when a group
+should always be routed.  The group is listed as
+.Cm static
+in the
+.Nm mroutectl
+output.
+.Pp
+In setups where there is only a single multicast router running
+.Nm mrouted ,
+this works just as a (*,G) route in
+.Xr smcrouted 8 .
+With the added exception for better handling of dynamic changes to the
+input interface.
+.Pp
+This can also be used for testing routing without having to set up IGMP
+capable receivers.
+.It Cm join-group Ar group
+This setting makes
+.Nm mrouted
+join the desired
+.Ar group
+on the
+.Cm phyint
+connected to the LAN which is source of the multicast to be forwarded.
+Useful when there are switches with IGMP snooping that do not detect
+.Nm mrouted
+as a multicast router, and thus prevent flooding multicast on the
+corresponding port.  Most managed switches support configuring a
+static multicast router port, but sometimes that is not available,
+or access to the switch is restricted.
+.It Cm altnet Ar network Ns / Ns Ar mask-len
 If an interface is attached to multiple IP subnets, describe each
 additional subnet with this keyword.
-.It Cm boundary
+.It Cm boundary Ar boundary-name | scoped-addr Ns / Ns Ar mask-len
 allows an interface to be configured as an administrative boundary
 for the specified scoped address.
 Packets belonging to this address will not be forwarded on a scoped interface.
 The boundary option accepts either a name or a boundary spec.
-.It Cm metric
+.It Cm metric Ar <1-31>
 is the "cost" associated with sending a datagram on the given interface
-or tunnel; it may be used to influence the choice of routes.  The metric
+or tunnel; it may be used to influence the choice of routes.  The
+.Cm metric
 defaults to 1.  Metrics should be kept as small as possible, because
 .Nm mrouted
 cannot route along paths with a sum of metrics greater than 31.
-.It Cm rate-limit
+.It Cm advert-metric Ar <0-31>
+The "cost" advertised to neighbors for the given interface or tunnel; it
+may be used to influence the choice of routes on the neighbor side.  The
+.Cm advert-metric
+defaults to 0.  Note that the effective metric of a link is one end's
+.Cm metric
+plus the other end's
+.Cm advert-metric .
+.It Cm force-leaf
+Force
+.Nm mrouted
+to ignore other routers on this interface.
+.Nm mrouted
+will never send or accept neighbor probes or route reports on this
+interface.
+.It Cm noflood
+As described above, but only applicable to this interface/tunnel.
+.It Cm passive
+No packets will be sent on this link or tunnel until we hear from the
+other end.  This is useful for the "server" end of a tunnel that goes
+over a dial-on-demand link; configure the "server" end as passive and it
+will not send its periodic probes until it hears one from the other
+side, so will not keep the link up.  If this option is specified on both
+ends of a tunnel, the tunnel will never come up.
+.It Cm blaster
+Enable handling of routers (mostly Cisco) that overwhelm socket buffers
+by "blasting" the whole routing table at once.
+.It Cm prune-lifetime Ar sec
+As described above, but only applicable to this interface/tunnel.
+.It Cm rexmit-prunes Op Ar on | off
+As described above, but only applicable to this interface/tunnel.
+Recall that prune retransmission defaults to
+.Ar on
+on point-to-point links and tunnels, and
+.Ar off
+on multi-access links.
+.It Cm allow-nonpruners
+By default,
+.Nm mrouted
+refuses to peer with DVMRP neighbors that do not claim to support
+pruning.  This option allows such peerings on this interface.
+.It Cm notransit
+A specialized case of route filtering; no route learned from an
+interface marked
+.Cm notransit
+will be advertised on another interface marked
+.Cm notransit .
+Marking only a single interface
+.Cm notransit
+has no meaning.
+.It Cm accept|deny Po Ar route Ns / Ns Ar mask-len Oo Cm exact Oc Pc Ns + Oo Cm bidir Oc
+The
+.Cm accept
+and
+.Cm deny
+commands allow rudimentary route filtering.  The
+.Cm accept
+command causes
+.Nm mrouted
+to accept only the listed routes on the configured interface; the
+.Cm deny
+command causes
+.Nm mrouted
+to accept all but the listed routes.  Only one of
+.Cm accept
+or
+.Cm deny
+commands may be used on a given interface.
+.Pp
+The list of routes follows the
+.Cm accept
+or
+.Cm deny
+keyword.  If the keyword
+.Ar exact
+follows a route, then only that route is matched; otherwise, that route
+and any more specific route is matched.  For example,
+.Cm deny 0/0
+denies all routes, while
+.Cm deny 0/0 Ar exact
+denies only the default route.  The default route may also be specified
+with the
+.Cm default
+keyword.
+.Pp
+The
+.Cm bidir
+keyword enables bidirectional route filtering; the filter will be
+applied to routes on both output and input.  Without the
+.Cm bidir
+keyword,
+.Cm accept
+and
+.Cm deny
+filters are only applied on input.  Poison reverse routes are never
+filtered out.
+.It Cm rate-limit Ar kbps
 allows the network administrator to specify a certain bandwidth in kbps
 which would be allocated to multicast traffic.  It defaults to 500 kbps
 on tunnels, and 0 (unlimited) on physical interfaces.
-.It Cm threshold
+.It Cm threshold Ar ttl
 is the minimum IP time-to-live required for a multicast datagram to be
 forwarded to the given interface or tunnel.  It is used to control the
 scope of multicast datagrams.  (The TTL of forwarded packets is only
@@ -153,7 +374,7 @@ compared to the threshold, it is not decremented by the threshold.
 Every multicast router decrements the TTL by 1.)  The default threshold
 for multicast is 1.
 .El
-.It Cm tunnel Ar local-addr Ar remote-addr Oo Cm boundary Ar boundary-name | scoped-addr Ns / Ns Ar mask-len Oc Oo Cm metric Ar <1-31> Oc Oo Cm rate-limit Ar kbps Oc Oo Cm threshold Ar ttl Oc
+.It Cm tunnel Ar local-addr Ar remote-addr Oo Cm beside Oo Ar on | off Oc Oc Oo Cm boundary Ar boundary-name | scoped-addr Ns / Ns Ar mask-len Oc Oo Cm metric Ar <1-31> Oc Oo Cm advert-metric Ar <0-31> Oc Oo Cm noflood Oc Oo Cm passive Oc Oo Cm blaster Oc Oo Cm prune-lifetime Ar sec Oc Oo Cm rexmit-prunes Oo Ar on | off Oc Oc Oo Cm allow-nonpruners Oc Oo Cm rate-limit Ar kbps Oc Oo Cm threshold Ar ttl Oc
 .Pp
 This setting can be used to establish a tunnel link between local IP
 address
@@ -237,5 +458,4 @@ Main configuration file.
 .Xr mroutectl 8
 .Sh AUTHORS
 This manual page was written by
-.An Joachim Nilsson Aq mailto:troglobit@gmail.com .
-
+.An Joachim Wiberg Aq mailto:troglobit@gmail.com .

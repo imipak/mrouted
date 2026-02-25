@@ -6,10 +6,12 @@
  * The mrouted program is COPYRIGHT 1989 by The Board of Trustees of
  * Leland Stanford Junior University.
  */
+
 #ifndef MROUTED_DEFS_H_
 #define MROUTED_DEFS_H_
 
-#include <config.h>
+#include "config.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -32,6 +34,7 @@
 #include <sys/un.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/igmp.h>
@@ -74,10 +77,7 @@ typedef void (*ihfunc_t) (int);
 #include "route.h"
 #include "prune.h"
 #include "pathnames.h"
-#ifdef RSRR
-#include "rsrr.h"
-#include "rsrr_var.h"
-#endif
+#include "pev.h"
 
 /*
  * Miscellaneous constants and macros.
@@ -101,7 +101,7 @@ typedef void (*ihfunc_t) (int);
 #define EQUAL(s1, s2)	(strcmp((s1), (s2)) == 0)
 #define ARRAY_LEN(a)    (sizeof((a)) / sizeof((a)[0]))
 
-#define TIMER_INTERVAL	2
+#define TIMER_INTERVAL	ROUTE_MAX_REPORT_DELAY
 
 #define PROTOCOL_VERSION 3  /* increment when packet format/content changes */
 #define MROUTED_VERSION	 9  /* not in DVMRP packets at all */
@@ -111,7 +111,7 @@ typedef void (*ihfunc_t) (int);
 #define MROUTED_LEVEL  (DVMRP_CONSTANT | PROTOCOL_VERSION)
 			    /* for IGMP 'group' field of DVMRP messages */
 
-#define LEAF_FLAGS	(( vifs_with_neighbors == 1 ) ? 0x010000 : 0)
+#define LEAF_FLAGS	(neighbor_vifs == 1 ? 0x010000 : 0)
 			    /* more for IGMP 'group' field of DVMRP messages */
 
 #define	DEL_RTE_GROUP	0
@@ -120,16 +120,17 @@ typedef void (*ihfunc_t) (int);
 
 #define JAN_1970	2208988800UL	/* 1970 - 1900 in seconds */
 
-#ifdef RSRR
-#define BIT_ZERO(X)      ((X) = 0)
-#define BIT_SET(X,n)     ((X) |= 1 << (n))
-#define BIT_CLR(X,n)     ((X) &= ~(1 << (n)))
-#define BIT_TST(X,n)     ((X) & 1 << (n))
-#endif
-
 #if defined(_AIX) || (defined(BSD) && BSD >= 199103)
 #define	HAVE_SA_LEN
 #endif
+
+/*
+ * Extensions to errno for singaling to cfparse.y
+ */
+#define ENOTMINE 	2000
+#define ELOOPBACK	2001
+#define ERMTLOCAL	2002
+#define EDUPLICATE	2003
 
 /*
  * External declarations for global variables and functions.
@@ -139,12 +140,15 @@ extern uint8_t		*recv_buf;
 extern uint8_t		*send_buf;
 extern int		igmp_socket;
 extern int		router_alert;
+extern uint32_t		router_timeout;
 extern uint32_t		allhosts_group;
 extern uint32_t		allrtrs_group;
 extern uint32_t		allreports_group;
 extern uint32_t		dvmrp_group;
 extern uint32_t		dvmrp_genid;
 extern uint32_t		igmp_query_interval;
+extern uint32_t		igmp_response_interval;
+extern uint32_t		igmp_last_member_interval;
 extern uint32_t		igmp_robustness;
 extern uint32_t		virtual_time;
 
@@ -162,10 +166,10 @@ extern uint32_t		virtual_time;
 #define	DEBUG_IGMP	0x0200
 #define	DEBUG_RTDETAIL	0x0400
 #define	DEBUG_KERN	0x0800
-#define	DEBUG_RSRR	0x1000
+#define	DEBUG_RSRR	0x1000		/* UNUSED */
 #define	DEBUG_ICMP	0x2000
 #define DEBUG_PARSE_ERR 0x80000000
-#define DEBUG_ALL       0xffffffff
+#define DEBUG_ALL       0xffffffdf /* All except noisy timer */
 
 struct debugnm {
 	char		*name;
@@ -185,11 +189,10 @@ extern int		routes_changed;
 extern int		delay_change_reports;
 extern unsigned		nroutes;
 
-extern struct uvif	uvifs[MAXVIFS];
 extern vifi_t		numvifs;
 extern int		vifs_down;
 extern int		udp_socket;
-extern int		vifs_with_neighbors;
+extern int		neighbor_vifs;
 
 #define MAX_INET_BUF_LEN 19
 extern char		s1[MAX_INET_BUF_LEN];
@@ -247,24 +250,26 @@ extern int              debug_parse(char *arg);
 
 
 /* main.c */
+extern char	       *config_file;
+extern int		cache_lifetime;
+extern int		prune_lifetime;
+extern int		mrt_table_id;
 extern int              debug_list(int, char *, size_t);
 extern int              debug_parse(char *);
 extern void             restart(void);
 extern char *		scaletime(time_t);
-extern int		register_input_handler(int, ihfunc_t);
 
 /* log.c */
-extern void             log_init(void);
+extern void             log_init(char *);
 extern int		log_str2lvl(char *);
 extern const char *	log_lvl2str(int);
 extern int		log_list(char *, size_t);
-extern void		logit(int, int, const char *, ...);
-extern void             resetlogging(void *);
+extern void		logit(int, int, const char *, ...) __attribute__ ((format (printf, 3, 4)));
 
 /* igmp.c */
 extern void		igmp_init(void);
 extern void		igmp_exit(void);
-extern void		accept_igmp(size_t);
+extern void		accept_igmp(int, size_t);
 extern size_t		build_igmp(uint32_t, uint32_t, int, int, uint32_t, int);
 extern void		send_igmp(uint32_t, uint32_t, int, int, uint32_t, int);
 extern char *		igmp_packet_kind(uint32_t, uint32_t);
@@ -278,16 +283,6 @@ extern void		init_ipip(void);
 extern void		init_ipip_on_vif(struct uvif *);
 extern void		send_ipip(uint32_t, uint32_t, int, int, uint32_t, int, struct uvif *);
 
-/* timer.c */
-extern void		timer_init(void);
-extern void		timer_exit(void);
-extern void		timer_stop_all(void);
-extern void		timer_age_queue(time_t);
-extern int		timer_next_delay(void);
-extern int		timer_set(time_t, cfunc_t, void *);
-extern int		timer_get(int);
-extern void		timer_clear(int);
-
 /* route.c */
 extern void		init_routes(void);
 extern void		start_route_updates(void);
@@ -297,11 +292,11 @@ extern void		expire_all_routes(void);
 extern void		free_all_routes(void);
 extern void		accept_probe(uint32_t, uint32_t, char *, size_t, uint32_t);
 extern void		accept_report(uint32_t, uint32_t, char *, size_t, uint32_t);
-extern struct rtentry *	determine_route(uint32_t src);
+extern struct rtentry  *determine_route(uint32_t src);
+extern struct rtentry  *route_iter(struct rtentry **rt);
 extern void		report(int, vifi_t, uint32_t);
 extern void		report_to_all_neighbors(int);
 extern int		report_next_chunk(void);
-extern void		blaster_alloc(vifi_t);
 extern void		add_vif_to_routes(vifi_t);
 extern void		delete_vif_from_routes(vifi_t);
 extern void		add_neighbor_to_routes(vifi_t, uint32_t);
@@ -310,11 +305,16 @@ extern void		dump_routes(FILE *, int);
 
 /* vif.c */
 extern void		init_vifs(void);
+extern void		blaster_alloc(struct uvif *);
+extern void		blaster_free(struct uvif *);
 extern void		zero_vif(struct uvif *, int);
 extern void		init_installvifs(void);
+extern int		install_uvif(struct uvif *);
 extern void		check_vif_state(void);
 extern void		send_on_vif(struct uvif *, uint32_t, int, size_t);
-extern vifi_t		find_vif(uint32_t, uint32_t);
+extern struct uvif     *find_uvif(vifi_t);
+extern vifi_t		find_vif(int);
+extern vifi_t		find_vif_direct(uint32_t, uint32_t);
 extern uint32_t         vif_nbr_expire_time(struct listaddr *);
 extern void		age_vifs(void);
 extern char            *vif_sflags(uint32_t);
@@ -323,9 +323,9 @@ extern char            *vif_nbr_sflags(uint16_t);
 extern void		dump_vifs(FILE *, int);
 extern void		stop_all_vifs(void);
 extern struct listaddr *neighbor_info(vifi_t, uint32_t);
-extern void		accept_group_report(uint32_t, uint32_t, uint32_t, int);
-extern void		query_groups(void *);
-extern void		query_dvmrp(void *);
+extern void		accept_group_report(int, uint32_t, uint32_t, uint32_t, int);
+extern void		query_groups(int, void *);
+extern void		query_dvmrp(int, void *);
 extern void		probe_for_neighbors(void);
 extern struct listaddr *update_neighbor(vifi_t, uint32_t, int, char *, size_t, uint32_t);
 extern void		accept_neighbor_request(uint32_t, uint32_t);
@@ -334,17 +334,23 @@ extern void		accept_info_request(uint32_t, uint32_t, uint8_t *, size_t);
 extern void		accept_info_reply(uint32_t, uint32_t, uint8_t *, size_t);
 extern void		accept_neighbors(uint32_t, uint32_t, uint8_t *, size_t, uint32_t);
 extern void		accept_neighbors2(uint32_t, uint32_t, uint8_t *, size_t, uint32_t);
-extern void		accept_leave_message(uint32_t, uint32_t, uint32_t);
-extern void		accept_membership_query(uint32_t, uint32_t, uint32_t, int, int);
-extern void             accept_membership_report(uint32_t, uint32_t, struct igmpv3_report *, ssize_t);
+extern void		accept_leave_message(int, uint32_t, uint32_t, uint32_t);
+extern void		accept_membership_query(int, uint32_t, uint32_t, uint32_t, int, int);
+extern void             accept_membership_report(int, uint32_t, uint32_t, struct igmpv3_report *, ssize_t);
 
 /* config.c */
+extern void		config_set_ifflag(uint32_t flag);
+extern struct uvif     *config_find_ifname(char *nm);
+extern struct uvif     *config_find_ifaddr(in_addr_t addr);
+extern struct uvif     *config_init_tunnel(in_addr_t lcl_addr, in_addr_t rmt_addr, uint32_t flags);
+extern void		config_vifs_correlate(void);
 extern void		config_vifs_from_kernel(void);
 
 /* cfparse.y */
 extern void		config_vifs_from_file(void);
 
 /* inet.c */
+extern int		inet_valid_group(uint32_t);
 extern int		inet_valid_host(uint32_t);
 extern int		inet_valid_mask(uint32_t);
 extern int		inet_valid_subnet(uint32_t, uint32_t);
@@ -352,7 +358,7 @@ extern char            *inet_name(uint32_t, int);
 extern char            *inet_fmt(uint32_t, char *, size_t);
 extern char            *inet_fmts(uint32_t, uint32_t, char *, size_t);
 extern uint32_t		inet_parse(char *, int);
-extern int		inet_cksum(uint16_t *, uint32_t);
+extern uint16_t		inet_cksum(uint16_t *, uint32_t);
 
 /* prune.c */
 extern struct gtable	*kernel_table;
@@ -387,6 +393,7 @@ extern int              curttl;
 
 extern void		k_set_rcvbuf(int, int);
 extern void		k_hdr_include(int);
+extern void		k_set_pktinfo(int);
 extern void		k_set_ttl(int);
 extern void		k_set_loop(int);
 extern void		k_set_if(uint32_t);
@@ -400,27 +407,20 @@ extern void		k_add_rg(uint32_t, struct gtable *);
 extern int		k_del_rg(uint32_t, struct gtable *);
 extern int		k_get_version(void);
 
-#ifdef RSRR
-/* rsrr.c */
-extern void		rsrr_init(void);
-extern void		rsrr_clean(void);
-extern void		rsrr_cache_send(struct gtable *, int);
-extern void		rsrr_cache_clean(struct gtable *);
-#endif
-
 #ifndef HAVE_STRLCPY
-size_t strlcpy(char *dst, const char *src, size_t siz);
+extern size_t		strlcpy(char *dst, const char *src, size_t siz);
 #endif
 
 #ifndef HAVE_STRLCAT
-size_t  strlcat(char *dst, const char *src, size_t siz);
+extern size_t		strlcat(char *dst, const char *src, size_t siz);
 #endif
 
 #ifndef HAVE_STRTONUM
-long long strtonum(const char *numstr, long long minval, long long maxval, const char **errstrp);
+extern long long	strtonum(const char *numstr, long long minval, long long maxval, const char **errstrp);
 #endif
+
 #ifndef HAVE_PIDFILE
-int pidfile(const char *basename);
+extern int		pidfile(const char *basename);
 #endif
 
 /*
@@ -453,10 +453,10 @@ struct ipc {
 };
 
 /* ipc.c */
-void ipc_init(void);
-void ipc_exit(void);
+extern void		ipc_init(char *sockfile, char *ident);
+extern void		ipc_exit(void);
 
 /* Shared constants between mrouted and mroutectl */
-static const char *versionstring = "mrouted version " PACKAGE_VERSION;
+static const char      *versionstring = "mrouted version " PACKAGE_VERSION;
 
 #endif /* MROUTED_DEFS_H_ */

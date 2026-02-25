@@ -11,6 +11,14 @@ Comment: This project was made fully open source by Standford in March 2003
 	 http://www.openbsd.org/cgi-bin/cvsweb/src/usr.sbin/mrouted/LICENSE
 License: MROUTED
 
+Files: src/pev.[ch]
+Copyright: Free software under the UNLICENSE
+License: public-domain
+
+Files: src/ipc.c src/mroutectl.c
+Copyright: 2018-2020  Joachim Wiberg
+License: BSD-3-clause
+
 Files: lib/strlcpy.c
 Copyright: 1998, 2015 Todd C. Miller <Todd.Miller@courtesan.com>
 License: ISC
@@ -27,13 +35,17 @@ Files: lib/pidfile.c
 Copyright: 1999 The NetBSD Foundation, Inc.
 License: BSD-2-clause 
 
+Files: lib/utimensat.c
+Copyright: 2017-2020  Joachim Wiberg
+License: ISC
+
 Files: debian/*
-Comment: mrouted was repackaged by Joachim Nilsson <troglobit@gmail.com>
+Comment: mrouted was repackaged by Joachim Wiberg <troglobit@gmail.com>
          on Mon, 17 Aug 2010 08:32:02 +0100 based on an earlier (failed)
 	 attempt by Christoph Martin <christoph.martin@uni-mainz.de> on
 	 Mon, 1 Mar 1999 21:36:23 +0100, which was dropped by Debian:
 	 http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=288112
-Copyright: 2010-2019 Joachim Nilsson <troglobit@gmail.com>
+Copyright: 2010-2020 Joachim Wiberg <troglobit@gmail.com>
 License: ISC
 
 License: MROUTED

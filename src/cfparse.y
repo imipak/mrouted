@@ -20,16 +20,9 @@ static void        warn(const char *fmt, ...);
 static void        yyerror(char *s);
 static char       *next_word(void);
 static int         yylex(void);
-static uint32_t    valid_if(char *s);
-static const char *ifconfaddr(uint32_t addr);
 int                yyparse(void);
 
 static FILE *fp;
-
-char *configfilename = _PATH_MROUTED_CONF;
-
-extern int cache_lifetime;
-extern int prune_lifetime;
 
 int allow_black_holes = 0;
 
@@ -43,13 +36,13 @@ static int noflood = 0;
 static int rexmit = VIFF_REXMIT_PRUNES;
 
 struct addrmask {
-	uint32_t addr;
-	int mask;
+    uint32_t addr;
+    int mask;
 };
 
 struct boundnam {
-	char		*name;
-	struct addrmask	 bound;
+    char		*name;
+    struct addrmask	 bound;
 };
 
 #define MAXBOUNDS 20
@@ -61,28 +54,28 @@ int numbounds = 0;			/* Number of named boundaries */
 
 %union
 {
-	int num;
-	char *ptr;
-	struct addrmask addrmask;
-	uint32_t addr;
-	struct vf_element *filterelem;
+    int num;
+    char *ptr;
+    struct addrmask addrmask;
+    uint32_t addr, group;
+    struct vf_element *filterelem;
 };
 
 %token CACHE_LIFETIME PRUNE_LIFETIME PRUNING BLACK_HOLE NOFLOOD
-%token QUERY_INTERVAL IGMP_ROBUSTNESS NO
-%token PHYINT TUNNEL NAME
-%token DISABLE ENABLE IGMPV1 IGMPV2 IGMPV3 SRCRT BESIDE
+%token QUERY_INTERVAL QUERY_LAST_MEMBER_INTERVAL QUERY_RESPONSE_INTERVAL IGMP_ROBUSTNESS
+%token NO PHYINT TUNNEL NAME
+%token DISABLE ENABLE IGMPV1 IGMPV2 IGMPV3 STATIC_GROUP JOIN_GROUP SRCRT BESIDE
 %token METRIC THRESHOLD RATE_LIMIT BOUNDARY NETMASK ALTNET ADVERT_METRIC
 %token FILTER ACCEPT DENY EXACT BIDIR REXMIT_PRUNES REXMIT_PRUNES2
 %token PASSIVE ALLOW_NONPRUNERS
-%token NOTRANSIT BLASTER FORCE_LEAF ROUTER_ALERT
+%token NOTRANSIT BLASTER FORCE_LEAF ROUTER_ALERT ROUTER_TIMEOUT
 %token PRUNE_LIFETIME2 NOFLOOD2
 %token SYSNAM SYSCONTACT SYSVERSION SYSLOCATION
 %token <num> BOOLEAN
 %token <num> NUMBER
 %token <ptr> STRING
 %token <addrmask> ADDRMASK
-%token <addr> ADDR
+%token <addr> ADDR GROUP
 
 %type <addr> interface addrname
 %type <addrmask> bound boundary addrmask
@@ -100,96 +93,55 @@ stmts	: /* Empty */
 	;
 
 stmt	: error
-	| NO PHYINT
-	{
-	    vifi_t vifi;
-
-	    for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v)
-		v->uv_flags |= VIFF_DISABLED;
-	}
+	| NO PHYINT		{ config_set_ifflag(VIFF_DISABLED); }
 	| PHYINT interface
 	{
-	    vifi_t vifi;
-
 	    state++;
 
 	    if (order)
 		fatal("phyints must appear before tunnels");
 
-	    for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v) {
-		if (!(v->uv_flags & VIFF_TUNNEL) && $2 == v->uv_lcl_addr)
-		    break;
-	    }
-
-	    if (vifi == numvifs) {
-		if ($2)
-			warn("phyint %s not available, continuing ...", inet_fmt($2, s1, sizeof(s1)));
+	    v = config_find_ifaddr($2);
+	    if (!v) {
+		if ($2 != 0)
+		    warn("phyint %s not available, continuing ...", inet_fmt($2, s1, sizeof(s1)));
 		v = &scrap;
 	    }
 	}
 	ifmods
 	| TUNNEL interface addrname
 	{
-	    const char *ifname;
-	    struct ifreq ffr;
-	    vifi_t vifi;
-
 	    order++;
-
-	    ifname = ifconfaddr($2);
-	    if (ifname == 0)
-		fatal("Tunnel local address %s is not mine", inet_fmt($2, s1, sizeof(s1)));
-
-	    if (((ntohl($2) & IN_CLASSA_NET) >> IN_CLASSA_NSHIFT) == IN_LOOPBACKNET)
-		fatal("Tunnel local address %s is a loopback address", inet_fmt($2, s1, sizeof(s1)));
-
-	    if (ifconfaddr($3) != NULL)
-		fatal("Tunnel remote address %s is one of mine", inet_fmt($3, s1, sizeof(s1)));
-
-	    for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v) {
-		if (v->uv_flags & VIFF_TUNNEL) {
-		    if ($3 == v->uv_rmt_addr)
-			fatal("Duplicate tunnel to %s",
-			      inet_fmt($3, s1, sizeof(s1)));
-		} else if (!(v->uv_flags & VIFF_DISABLED)) {
-		    if (($3 & v->uv_subnetmask) == v->uv_subnet)
-			fatal("Unnecessary tunnel to %s, same subnet as vif %d (%s)",
-			      inet_fmt($3, s1, sizeof(s1)), vifi, v->uv_name);
+	    v = config_init_tunnel($2, $3, rexmit | noflood);
+	    if (!v) {
+		switch (errno) {
+		case ENOTMINE:
+		    fatal("Tunnel local address %s is not mine", inet_fmt($2, s1, sizeof(s1)));
+		    break;
+		case ELOOPBACK:
+		    fatal("Tunnel local address %s is a loopback address",
+			  inet_fmt($2, s1, sizeof(s1)));
+		    break;
+		case ERMTLOCAL:
+		    fatal("Tunnel remote address %s is one of mine",
+			  inet_fmt($3, s1, sizeof(s1)));
+		    break;
+		case EDUPLICATE:
+		    fatal("Duplicate tunnel to %s", inet_fmt($3, s1, sizeof(s1)));
+		    break;
+		default:
+		    /* Log file and line number at least */
+		    fatal("");
+		    break;
 		}
-	    }
 
-	    if (numvifs == MAXVIFS)
-		fatal("too many vifs");
-
-	    strlcpy(ffr.ifr_name, ifname, sizeof(ffr.ifr_name));
-	    if (ioctl(udp_socket, SIOCGIFFLAGS, (char *)&ffr)<0)
-		fatal("ioctl SIOCGIFFLAGS on %s", ffr.ifr_name);
-
-	    v = &uvifs[numvifs];
-	    zero_vif(v, 1);
-	    v->uv_flags      = VIFF_TUNNEL | rexmit | noflood;
-	    v->uv_flags     |= VIFF_OTUNNEL; /* XXX */
-	    v->uv_lcl_addr   = $2;
-	    v->uv_rmt_addr   = $3;
-	    v->uv_dst_addr   = $3;
-	    strlcpy(v->uv_name, ffr.ifr_name, sizeof(v->uv_name));
-
-	    if (!(ffr.ifr_flags & IFF_UP)) {
-		v->uv_flags |= VIFF_DOWN;
-		vifs_down = TRUE;
+		v = &scrap;
 	    }
 	}
 	tunnelmods
 	{
 	    if (!(v->uv_flags & VIFF_OTUNNEL))
 		init_ipip_on_vif(v);
-
-	    logit(LOG_INFO, 0, "installing tunnel from %s to %s as vif #%u - rate=%d",
-		  inet_fmt($2, s1, sizeof(s1)), inet_fmt($3, s2, sizeof(s2)),
-		  numvifs, v->uv_rate_limit);
-
-	    ++numvifs;
-
 	}
 	| CACHE_LIFETIME NUMBER
 	{
@@ -218,6 +170,12 @@ stmt	: error
 	{
 	    router_alert = $2;
 	}
+	| ROUTER_TIMEOUT NUMBER
+	{
+	    if ($2 < 1 || $2 > 1024)
+		fatal("Invalid multicast router timeout [1,1024]: %d", $2);
+	    router_timeout = $2;
+	}
 	| BLACK_HOLE
 	{
 #ifdef ALLOW_BLACK_HOLES
@@ -231,11 +189,8 @@ stmt	: error
 	 */
 	| NOFLOOD
 	{
-	    vifi_t vifi;
-
 	    noflood = VIFF_NOFLOOD;
-	    for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v)
-		v->uv_flags |= VIFF_NOFLOOD;
+	    config_set_ifflag(VIFF_NOFLOOD);
 	}
 	/*
 	 * Turn on prune retransmission on all interfaces.
@@ -244,10 +199,7 @@ stmt	: error
 	 */
 	| REXMIT_PRUNES
 	{
-	    vifi_t vifi;
-
-	    for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v)
-		v->uv_flags |= VIFF_REXMIT_PRUNES;
+	    config_set_ifflag(VIFF_REXMIT_PRUNES);
 	}
 	/*
 	 * If true, do as above.  If false, no need to turn
@@ -256,14 +208,10 @@ stmt	: error
 	 */
 	| REXMIT_PRUNES BOOLEAN
 	{
-	    if ($2) {
-		vifi_t vifi;
-
-		for (vifi = 0, v = uvifs; vifi < numvifs; ++vifi, ++v)
-		    v->uv_flags |= VIFF_REXMIT_PRUNES;
-	    } else {
+	    if ($2)
+		config_set_ifflag(VIFF_REXMIT_PRUNES);
+	    else
 		rexmit = 0;
-	    }
 	}
 	| NAME STRING boundary
 	{
@@ -297,6 +245,18 @@ stmt	: error
 	    if ($2 < 1 || $2 > 1024)
 		fatal("Invalid IGMP query interval [1,1024]: %d", $2);
 	    igmp_query_interval = $2;
+	}
+	| QUERY_RESPONSE_INTERVAL NUMBER
+	{
+	    if ($2 < 1 || $2 > 1024)
+		fatal("Invalid IGMP query response interval [1,1024]: %d", $2);
+	    igmp_response_interval = $2;
+	}
+	| QUERY_LAST_MEMBER_INTERVAL NUMBER
+	{
+	    if ($2 < 1 || $2 > 1024)
+		fatal("Invalid IGMP query interval [1,1024]: %d", $2);
+	    igmp_last_member_interval = $2;
 	}
 	| IGMP_ROBUSTNESS NUMBER
 	{
@@ -338,6 +298,40 @@ ifmod	: mod
 	| IGMPV1		{ v->uv_flags &= ~VIFF_IGMPV2; v->uv_flags |= VIFF_IGMPV1; }
 	| IGMPV2		{ v->uv_flags &= ~VIFF_IGMPV1; v->uv_flags |= VIFF_IGMPV2; }
 	| IGMPV3		{ v->uv_flags &= ~VIFF_IGMPV1; v->uv_flags &= ~VIFF_IGMPV2; }
+	| STATIC_GROUP GROUP
+	{
+	    struct listaddr *a;
+
+	    a = calloc(1, sizeof(struct listaddr));
+	    if (!a) {
+		fatal("Failed allocating memory for 'struct listaddr'");
+		return 0;
+	    }
+
+	    a->al_addr  = $2;
+	    a->al_pv    = 2;	/* IGMPv2 only, no SSM */
+	    a->al_flags = NBRF_STATIC_GROUP;
+	    time(&a->al_ctime);
+
+	    TAILQ_INSERT_TAIL(&v->uv_static, a, al_link);
+	}
+	| JOIN_GROUP GROUP
+	{
+	    struct listaddr *a;
+
+	    a = calloc(1, sizeof(struct listaddr));
+	    if (!a) {
+		fatal("Failed allocating memory for 'struct listaddr'");
+		return 0;
+	    }
+
+	    a->al_addr  = $2;
+	    a->al_pv    = 2;	/* IGMPv2 only, no SSM */
+	    a->al_flags = NBRF_JOIN_GROUP;
+	    time(&a->al_ctime);
+
+	    TAILQ_INSERT_TAIL(&v->uv_join, a, al_link);
+	}
 	| NETMASK addrname
 	{
 	    uint32_t subnet, mask;
@@ -424,7 +418,7 @@ mod	: THRESHOLD NUMBER
 	}
 	| ADVERT_METRIC
 	{
-	    warn("Expected number after advert_metric keyword, ignored");
+	    warn("Expected number after advert-metric keyword, ignored");
 	}
 	| RATE_LIMIT NUMBER
 	{
@@ -434,7 +428,7 @@ mod	: THRESHOLD NUMBER
 	}
 	| RATE_LIMIT
 	{
-	    warn("Expected number after rate_limit keyword, ignored");
+	    warn("Expected number after rate-limit keyword, ignored");
 	}
 	| BOUNDARY bound
 	{
@@ -484,7 +478,7 @@ mod	: THRESHOLD NUMBER
 	| BLASTER
 	{
 	    v->uv_flags |= VIFF_BLASTER;
-	    blaster_alloc(v - uvifs);
+	    blaster_alloc(v);
 	}
 	| ALLOW_NONPRUNERS
 	{
@@ -575,9 +569,18 @@ interface: ADDR
 	}
 	| STRING
 	{
-	    $$ = valid_if($1);
-	    if ($$ == 0)
+	    struct uvif *v;
+
+	    /*
+	     * Looks a little weird, but the orig. code was based around
+	     * the addresses being used to identify interfaces.
+	     */
+	    v = config_find_ifname($1);
+	    if (!v) {
 		warn("phyint %s not available, continuing ...", $1);
+		$$ = 0;
+	    } else
+		$$ = v->uv_lcl_addr;
 	}
 	;
 
@@ -602,8 +605,10 @@ addrname: ADDR
 		return 0;	/* Never reached */
 	    }
 
-	    if (result->ai_next)
+	    if (result->ai_next) {
+		freeaddrinfo(result);
 		fatal("Hostname %s does not %s", $1, "map to a unique address");
+	    }
 
 	    sin = (struct sockaddr_in *)result->ai_addr;
 	    $$  = sin->sin_addr.s_addr;
@@ -619,7 +624,7 @@ bound	: boundary
 	{
 	    int i;
 
-	    for (i=0; i < numbounds; i++) {
+	    for (i = 0; i < numbounds; i++) {
 		if (!strcmp(boundlist[i].name, $1)) {
 		    $$ = boundlist[i].bound;
 		    break;
@@ -687,7 +692,7 @@ static void fatal(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    logit(LOG_ERR, 0, "%s:%d: %s", configfilename, lineno, buf);
+    logit(LOG_ERR, 0, "%s:%d: %s", config_file, lineno, buf);
 }
 
 static void warn(const char *fmt, ...)
@@ -699,12 +704,12 @@ static void warn(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    logit(LOG_WARNING, 0, "%s:%d: %s", configfilename, lineno, buf);
+    logit(LOG_WARNING, 0, "%s:%d: %s", config_file, lineno, buf);
 }
 
 static void yyerror(char *msg)
 {
-    logit(LOG_ERR, 0, "%s:%d: %s", configfilename, lineno, msg);
+    logit(LOG_ERR, 0, "%s:%d: %s", config_file, lineno, msg);
 }
 
 static char *next_word(void)
@@ -759,6 +764,8 @@ static struct keyword {
 	{ "prune_lifetime",	PRUNE_LIFETIME,	PRUNE_LIFETIME2 },
 	{ "prune-lifetime",	PRUNE_LIFETIME,	PRUNE_LIFETIME2 },
 	{ "igmp-query-interval", QUERY_INTERVAL, 0 },
+	{ "igmp-query-reponse-interval", QUERY_RESPONSE_INTERVAL, 0 },
+	{ "igmp-query-last-member-interval", QUERY_LAST_MEMBER_INTERVAL, 0 },
 	{ "igmp-robustness",    IGMP_ROBUSTNESS, 0 },
 	{ "no",                 NO, 0 },
 	{ "pruning",		PRUNING, 0 },
@@ -775,13 +782,16 @@ static struct keyword {
 	{ "force_leaf",		FORCE_LEAF, 0 },
 	{ "force-leaf",		FORCE_LEAF, 0 },
 	{ "router-alert",	ROUTER_ALERT, 0 },
+	{ "router-timeout",	ROUTER_TIMEOUT, 0 },
 	{ "srcrt",		SRCRT, 0 },
 	{ "sourceroute",	SRCRT, 0 },
 	{ "boundary",		BOUNDARY, 0 },
 	{ "netmask",		NETMASK, 0 },
 	{ "igmpv1",		IGMPV1, 0 },
 	{ "igmpv2",		IGMPV2, 0 },
-	{ "igmpv2",		IGMPV3, 0 },
+	{ "igmpv3",		IGMPV3, 0 },
+	{ "static-group",	STATIC_GROUP, 0 },
+	{ "join-group",		JOIN_GROUP, 0 },
 	{ "altnet",		ALTNET, 0 },
 	{ "name",		NAME, 0 },
 	{ "accept",		ACCEPT, 0 },
@@ -853,10 +863,16 @@ static int yylex(void)
     }
 
     if (sscanf(q,"%[.0-9]%c",s1,s2) == 1) {
-	addr = inet_parse(s1,4);
-        if (addr != 0xffffffff && inet_valid_host(addr)) {
-            yylval.addr = addr;
-            return ADDR;
+	addr = inet_parse(s1, 4);
+        if (addr != 0xffffffff) {
+	    if (inet_valid_host(addr)) {
+		yylval.addr = addr;
+		return ADDR;
+	    }
+	    if (inet_valid_group(addr)) {
+		yylval.addr = addr;
+		return GROUP;
+	    }
         }
     }
 
@@ -877,15 +893,20 @@ static int yylex(void)
 
 void config_vifs_from_file(void)
 {
+    TAILQ_INIT(&scrap.uv_static);
+    TAILQ_INIT(&scrap.uv_join);
+    TAILQ_INIT(&scrap.uv_groups);
+    TAILQ_INIT(&scrap.uv_neighbors);
+
     order = 0;
     state = 0;
     numbounds = 0;
     lineno = 0;
 
-    fp = fopen(configfilename, "r");
+    fp = fopen(config_file, "r");
     if (!fp) {
         if (errno != ENOENT)
-            logit(LOG_ERR, errno, "Cannot open %s", configfilename);
+            logit(LOG_ERR, errno, "Cannot open %s", config_file);
         return;
     }
 
@@ -894,57 +915,9 @@ void config_vifs_from_file(void)
     fclose(fp);
 }
 
-static uint32_t valid_if(char *s)
-{
-    struct uvif *v;
-    vifi_t vifi;
-
-    if (!s)
-	return 0;
-
-    for (vifi = 0, v = uvifs; vifi < numvifs; vifi++, v++) {
-        if (!strcmp(v->uv_name, s))
-            return v->uv_lcl_addr;
-    }
-
-    return 0;
-}
-
-static const char *ifconfaddr(uint32_t addr)
-{
-    struct ifaddrs *ifap, *ifa;
-    static char buf[IFNAMSIZ];
-    char *ifname = NULL;
-
-    if (getifaddrs(&ifap) != 0)
-	return NULL;
-
-    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-	struct sockaddr_in *sin;
-
-	if (!ifa->ifa_addr)
-	    continue;
-	if (ifa->ifa_addr->sa_family != AF_INET)
-	    continue;
-
-	sin = (struct sockaddr_in *)ifa->ifa_addr;
-	if (sin->sin_addr.s_addr != addr)
-	    continue;
-
-	strlcpy(buf, ifa->ifa_name, sizeof(buf));
-	ifname = buf;
-	break;
-    }
-
-    freeifaddrs(ifap);
-
-    return ifname;
-}
-
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

@@ -25,7 +25,10 @@ uint8_t		*recv_buf; 		     /* input packet buffer         */
 uint8_t		*send_buf; 		     /* output packet buffer        */
 int		igmp_socket;		     /* socket for all network I/O  */
 int             router_alert;		     /* IP option Router Alert      */
+uint32_t	router_timeout;		     /* Other querier present intv. */
 uint32_t	igmp_query_interval;	     /* Default: 125 sec            */
+uint32_t	igmp_response_interval;	     /* Default: 10 sec		    */
+uint32_t	igmp_last_member_interval;   /* Default: 1                  */
 uint32_t	igmp_robustness;	     /* Default: 2                  */
 uint32_t	allhosts_group;		     /* All hosts addr in net order */
 uint32_t	allrtrs_group;		     /* All-Routers "  in net order */
@@ -34,8 +37,16 @@ uint32_t	dvmrp_group;		     /* DVMRP grp addr in net order */
 uint32_t	dvmrp_genid;		     /* IGMP generation id          */
 
 /*
+ * Local variables.
+ */
+#ifdef REGISTER_HANDLER
+static int	sock_id = -1;
+#endif
+
+/*
  * Local function definitions.
  */
+static void	igmp_read(int sd, void *arg);
 static int	igmp_log_level(uint32_t type, uint32_t code);
 
 /*
@@ -60,6 +71,7 @@ void igmp_init(void)
 	logit(LOG_ERR, errno, "Failed creating IGMP socket");
 
     k_hdr_include(TRUE);	/* include IP header when sending */
+    k_set_pktinfo(TRUE);	/* ifindex in aux data on receive */
     k_set_rcvbuf(256*1024,48*1024);	/* lots of input buffering        */
     k_set_ttl(1);		/* restrict multicasts to one hop */
     k_set_loop(FALSE);		/* disable multicast loopback     */
@@ -92,13 +104,26 @@ void igmp_init(void)
     allrtrs_group    = htonl(INADDR_ALLRTRS_GROUP);
     allreports_group = htonl(INADDR_ALLRPTS_GROUP);
 
-    igmp_query_interval = IGMP_QUERY_INTERVAL_DEFAULT;
-    igmp_robustness     = IGMP_ROBUSTNESS_DEFAULT;
-    router_alert        = 1;
+    igmp_query_interval       = IGMP_QUERY_INTERVAL_DEFAULT;
+    igmp_response_interval    = IGMP_QUERY_RESPONSE_INTERVAL;
+    igmp_last_member_interval = IGMP_LAST_MEMBER_INTERVAL_DEFAULT;
+    igmp_robustness           = IGMP_ROBUSTNESS_DEFAULT;
+    router_alert              = 1;
+    router_timeout            = IGMP_OTHER_QUERIER_PRESENT_INTERVAL;
+
+#ifdef REGISTER_HANDLER
+    sock_id = pev_sock_add(igmp_socket, igmp_read, NULL);
+    if (sock_id < 0)
+	logit(LOG_ERR, 0, "Failed registering IGMP handler");
+#endif
 }
 
 void igmp_exit(void)
 {
+#ifdef REGISTER_HANDLER
+    if (sock_id >= 0)
+	pev_sock_del(sock_id);
+#endif
     close(igmp_socket);
     free(recv_buf);
     free(send_buf);
@@ -110,9 +135,9 @@ char *igmp_packet_kind(uint32_t type, uint32_t code)
 
     switch (type) {
 	case IGMP_MEMBERSHIP_QUERY:		return "membership query  ";
-	case IGMP_V1_MEMBERSHIP_REPORT:		return "V1 member report  ";
-	case IGMP_V2_MEMBERSHIP_REPORT:		return "V2 member report  ";
-	case IGMP_V3_MEMBERSHIP_REPORT:		return "V3 member report  ";
+	case IGMP_V1_MEMBERSHIP_REPORT:		return "v1 member report  ";
+	case IGMP_V2_MEMBERSHIP_REPORT:		return "v2 member report  ";
+	case IGMP_V3_MEMBERSHIP_REPORT:		return "v3 member report  ";
 	case IGMP_V2_LEAVE_GROUP:		return "leave message     ";
 	case IGMP_DVMRP:
 	  switch (code) {
@@ -197,10 +222,55 @@ int igmp_debug_kind(uint32_t type, uint32_t code)
 }
 
 /*
+ * Read an IGMP message from igmp_socket
+ */
+static void igmp_read(int sd, void *arg)
+{
+    struct cmsghdr *cmsg;
+    struct msghdr msgh;
+    char cmbuf[0x100];
+    struct iovec iov;
+    int ifi = -1;
+    ssize_t len;
+
+    memset(&msgh, 0, sizeof(msgh));
+    iov.iov_base = recv_buf;
+    iov.iov_len = RECV_BUF_SIZE;
+    msgh.msg_control = cmbuf;
+    msgh.msg_controllen = sizeof(cmbuf);
+    msgh.msg_iov  = &iov;
+    msgh.msg_iovlen = 1;
+    msgh.msg_flags = 0;
+
+    while ((len = recvmsg(sd, &msgh, 0)) < 0) {
+	if (errno == EINTR)
+	    continue;		/* Received signal, retry syscall. */
+
+	logit(LOG_ERR, errno, "Failed recvfrom() in igmp_read()");
+	return;
+    }
+
+    for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg; cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+#ifdef IP_PKTINFO
+	const struct in_pktinfo *ipi = (struct in_pktinfo *)CMSG_DATA(cmsg);
+	char tmp[IF_NAMESIZE + 1] = { 0 };
+
+	if (cmsg->cmsg_level != SOL_IP || cmsg->cmsg_type != IP_PKTINFO)
+	    continue;
+
+	ifi = ipi->ipi_ifindex;
+	break;
+#endif
+    }
+
+    accept_igmp(ifi, len);
+}
+
+/*
  * Process a newly received IGMP packet that is sitting in the input
  * packet buffer.
  */
-void accept_igmp(size_t recvlen)
+void accept_igmp(int ifi, size_t recvlen)
 {
     struct igmp *igmp;
     struct ip *ip;
@@ -271,16 +341,16 @@ void accept_igmp(size_t recvlen)
 		logit(LOG_INFO, 0, "Received invalid IGMP query: Max Resp Code = %d, length = %d",
 		      igmp->igmp_code, ipdatalen);
 	    }
-	    accept_membership_query(src, dst, group, igmp->igmp_code, igmp_version);
+	    accept_membership_query(ifi, src, dst, group, igmp->igmp_code, igmp_version);
 	    return;
 
 	case IGMP_V1_MEMBERSHIP_REPORT:
 	case IGMP_V2_MEMBERSHIP_REPORT:
-	    accept_group_report(src, dst, group, igmp->igmp_type);
+	    accept_group_report(ifi, src, dst, group, igmp->igmp_type);
 	    return;
 
 	case IGMP_V2_LEAVE_GROUP:
-	    accept_leave_message(src, dst, group);
+	    accept_leave_message(ifi, src, dst, group);
 	    return;
 
 	case IGMP_V3_MEMBERSHIP_REPORT:
@@ -289,7 +359,7 @@ void accept_igmp(size_t recvlen)
 		      igmpdatalen, IGMP_V3_GROUP_RECORD_MIN_SIZE);
 		return;
 	    }
-	    accept_membership_report(src, dst, (struct igmpv3_report *)(recv_buf + iphdrlen), recvlen - iphdrlen);
+	    accept_membership_report(ifi, src, dst, (struct igmpv3_report *)(recv_buf + iphdrlen), recvlen - iphdrlen);
 	    return;
 
 	case IGMP_DVMRP:
@@ -582,11 +652,16 @@ void send_igmp(uint32_t src, uint32_t dst, int type, int code, uint32_t group, i
 
     rc = sendto(igmp_socket, send_buf, len, 0, (struct sockaddr *)&sin, sizeof(sin));
     if (rc < 0) {
-	if (errno == ENETDOWN)
+	switch (errno) {
+	case ENETUNREACH:
+	case ENETDOWN:
 	    check_vif_state();
-	else
+	    break;
+	default:
 	    logit(igmp_log_level(type, code), errno, "sendto to %s on %s",
 		  inet_fmt(dst, s1, sizeof(s1)), inet_fmt(src, s2, sizeof(s2)));
+	    break;
+	}
     }
 
     if (setloop)
@@ -602,7 +677,6 @@ void send_igmp(uint32_t src, uint32_t dst, int type, int code, uint32_t group, i
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

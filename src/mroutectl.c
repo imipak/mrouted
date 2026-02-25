@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Joachim Nilsson <troglobit@gmail.com>
+ * Copyright (c) 2018-2020  Joachim Wiberg <troglobit@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,6 +33,9 @@
 #ifdef HAVE_TERMIOS_H
 # include <termios.h>
 #endif
+#ifdef HAVE_SYS_IOCTL_H
+# include <sys/ioctl.h>
+#endif
 
 struct cmd {
 	char        *cmd;
@@ -45,7 +48,13 @@ static int plain = 0;
 static int detail = 0;
 static int heading = 1;
 
+static char *sock_file = NULL;
+static char *ident = PACKAGE_NAME;
 
+/*
+ * if ident is given, that's the name we're going for
+ * if ident starts with a /, we skip all dirs as well
+ */
 static int do_connect(void)
 {
 	struct sockaddr_un sun;
@@ -59,7 +68,10 @@ static int do_connect(void)
 	sun.sun_len = 0;	/* <- correct length is set by the OS */
 #endif
 	sun.sun_family = AF_UNIX;
-	strlcpy(sun.sun_path, _PATH_MROUTED_SOCK, sizeof(sun.sun_path));
+	if (sock_file)
+		strlcpy(sun.sun_path, sock_file, sizeof(sun.sun_path));
+	else
+		snprintf(sun.sun_path, sizeof(sun.sun_path), _PATH_MROUTED_SOCK, ident);
 	if (connect(sd, (struct sockaddr*)&sun, sizeof(sun)) == -1) {
 		close(sd);
 		goto error;
@@ -75,14 +87,28 @@ error:
 	return -1;
 }
 
-#define ESC "\033"
 static int get_width(void)
 {
-	int ret = 74;
+	int ret = 79;
 #ifdef HAVE_TERMIOS_H
-	char buf[42];
-	struct termios tc, saved;
 	struct pollfd fd = { STDIN_FILENO, POLLIN, 0 };
+	struct termios tc, saved;
+	struct winsize ws;
+	char buf[42];
+
+	if (!ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws))
+		return ws.ws_col;
+
+	if (!isatty(STDOUT_FILENO)) {
+		char *columns;
+
+		/* we may be running under watch(1) */
+		columns = getenv("COLUMNS");
+		if (columns)
+			return atoi(columns);
+
+		return ret;
+	}
 
 	memset(buf, 0, sizeof(buf));
 	tcgetattr(STDERR_FILENO, &tc);
@@ -90,16 +116,16 @@ static int get_width(void)
 	tc.c_cflag |= (CLOCAL | CREAD);
 	tc.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
 	tcsetattr(STDERR_FILENO, TCSANOW, &tc);
-	fprintf(stderr, ESC "7" ESC "[r" ESC "[999;999H" ESC "[6n");
+	fprintf(stderr, "\e7\e[r\e[999;999H\e[6n");
 
 	if (poll(&fd, 1, 300) > 0) {
 		int row, col;
 
-		if (scanf(ESC "[%d;%dR", &row, &col) == 2)
+		if (scanf("\e[%d;%dR", &row, &col) == 2)
 			ret = col;
 	}
 
-	fprintf(stderr, ESC "8");
+	fprintf(stderr, "\e8");
 	tcsetattr(STDERR_FILENO, TCSANOW, &saved);
 #endif
 	return ret;
@@ -283,7 +309,9 @@ static int usage(int rc)
 	       "  -d, --detail            Detailed output, where applicable\n"
 	       "  -p, --plain             Use plain table headings, no ctrl chars\n"
 	       "  -h, --help              This help text\n"
+	       "  -i, --ident=NAME        Connect to named mrouted instance\n"
 	       "  -t, --no-heading        Skip table headings\n"
+	       "  -u, --ipc=FILE          Override UNIX domain socket file\n"
 	       "  -v, --version           Show mrouted version mroutectl is built against\n"
 	       "\n"
 	       "Commands:\n"
@@ -363,16 +391,18 @@ int main(int argc, char *argv[])
 	struct option long_options[] = {
 		{ "detail",     0, NULL, 'd' },
 		{ "plain",      0, NULL, 'p' },
+		{ "ident",      1, NULL, 'i' },
 		{ "no-heading", 0, NULL, 't' },
 		{ "help",       0, NULL, 'h' },
+		{ "ipc",        1, NULL, 'u' },
 		{ "version",    0, NULL, 'v' },
-		{ 0 }
+		{ NULL, 0, NULL, 0 }
 	};
 	struct cmd igmp[] = {
 		{ "groups",     NULL, NULL,         IPC_SHOW_IGMP_GROUP_CMD },
 		{ "interfaces", NULL, NULL,         IPC_SHOW_IGMP_IFACE_CMD },
 		{ "ifaces",     NULL, NULL,         IPC_SHOW_IGMP_IFACE_CMD }, /* alias */
-		{ 0 }
+		{ NULL, NULL, NULL, 0 }
 	};
 	struct cmd show[] = {
 		{ "compat",     NULL, NULL,         IPC_SHOW_COMPAT_CMD     },
@@ -384,7 +414,7 @@ int main(int argc, char *argv[])
 		{ "neighbor",   NULL, NULL,         IPC_SHOW_NEIGH_CMD      },
 		{ "status",     NULL, NULL,         IPC_SHOW_STATUS_CMD     },
 		{ "version",    NULL, NULL,         IPC_VERSION_CMD         },
-		{ 0 }
+		{ NULL, NULL, NULL, 0 }
 	};
 	struct cmd command[] = {
 		{ "debug",      NULL, set_debug,    0                       },
@@ -393,11 +423,11 @@ int main(int argc, char *argv[])
 		{ "log",        NULL, set_loglevel, 0                       },
 		{ "restart",    NULL, NULL,         IPC_RESTART_CMD         },
 		{ "show",       show, show_status,  0                       },
-		{ 0 }
+		{ NULL, NULL, NULL, 0 }
 	};
 	int c;
 
-	while ((c = getopt_long(argc, argv, "dh?ptv", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "dh?i:ptu:v", long_options, NULL)) != EOF) {
 		switch(c) {
 		case 'd':
 			detail = 1;
@@ -407,12 +437,20 @@ int main(int argc, char *argv[])
 		case '?':
 			return usage(0);
 
+		case 'i':	/* --ident=NAME */
+			ident = optarg;
+			break;
+
 		case 'p':
 			plain = 1;
 			break;
 
 		case 't':
 			heading = 0;
+			break;
+
+		case 'u':
+			sock_file = optarg;
 			break;
 
 		case 'v':

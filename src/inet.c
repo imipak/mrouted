@@ -22,6 +22,18 @@ char s4[MAX_INET_BUF_LEN];
 
 
 /*
+ * Verify that a given IP address is a valid multigast group
+ */
+int inet_valid_group(uint32_t naddr)
+{
+    uint32_t addr;
+
+    addr = ntohl(naddr);
+
+    return IN_MULTICAST(addr);
+}
+
+/*
  * Verify that a given IP address is credible as a host address.
  * (Without a mask, cannot detect addresses of the form {subnet,0} or
  * {subnet,-1}.)
@@ -68,7 +80,8 @@ int inet_valid_subnet(uint32_t nsubnet, uint32_t nmask)
     subnet = ntohl(nsubnet);
     mask   = ntohl(nmask);
 
-    if ((subnet & mask) != subnet) return FALSE;
+    if ((subnet & mask) != subnet)
+	return FALSE;
 
     if (subnet == 0)
 	return mask == 0;
@@ -76,16 +89,18 @@ int inet_valid_subnet(uint32_t nsubnet, uint32_t nmask)
     if (IN_CLASSA(subnet)) {
 	if (mask < 0xff000000 ||
 	    (subnet & 0xff000000) == 0x7f000000 ||
-	    (subnet & 0xff000000) == 0x00000000) return FALSE;
-    }
-    else if (IN_CLASSD(subnet) || IN_BADCLASS(subnet)) {
+	    (subnet & 0xff000000) == 0x00000000)
+	    return FALSE;
+    } else if (IN_CLASSD(subnet) || IN_BADCLASS(subnet)) {
 	/* Above Class C address space */
 	return FALSE;
     }
+
     if (subnet & ~mask) {
 	/* Host bits are set in the subnet */
 	return FALSE;
     }
+
     if (!inet_valid_mask(mask)) {
 	/* Netmask is not contiguous */
 	return FALSE;
@@ -210,44 +225,41 @@ uint32_t inet_parse(char *s, int n)
  * Checksum routine for Internet Protocol family headers (C Version)
  *
  */
-int inet_cksum(uint16_t *addr, uint32_t len)
+uint16_t inet_cksum(uint16_t *addr, uint32_t len)
 {
-	int nleft = (int)len;
-	uint16_t *w = addr;
-	uint16_t answer = 0;
-	int32_t sum = 0;
+    int nleft = (int)len;
+    uint16_t *w = addr;
+    uint16_t answer = 0;
+    uint32_t sum = 0;
 
-	/*
-	 *  Our algorithm is simple, using a 32 bit accumulator (sum),
-	 *  we add sequential 16 bit words to it, and at the end, fold
-	 *  back all the carry bits from the top 16 bits into the lower
-	 *  16 bits.
-	 */
-	while (nleft > 1)  {
-		sum += *w++;
-		nleft -= 2;
-	}
+    /*
+     *  Our algorithm is simple, using a 32 bit accumulator (sum),
+     *  we add sequential 16 bit words to it, and at the end, fold
+     *  back all the carry bits from the top 16 bits into the lower
+     *  16 bits.
+     */
+    while (nleft > 1)  {
+	sum += *w++;
+	nleft -= 2;
+    }
 
-	/* mop up an odd byte, if necessary */
-	if (nleft == 1) {
-		*(uint8_t *) (&answer) = *(uint8_t *)w ;
-		sum += answer;
-	}
+    /* mop up an odd byte, if necessary */
+    if (nleft == 1) {
+	*(uint8_t *) (&answer) = *(uint8_t *)w ;
+	sum += answer;
+    }
 
-	/*
-	 * add back carry outs from top 16 bits to low 16 bits
-	 */
-	sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
-	sum += (sum >> 16);			/* add carry */
-	answer = ~sum;				/* truncate to 16 bits */
-
-	return answer;
+    /*
+     * add back carry outs from top 16 bits to low 16 bits
+     */
+    sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
+    sum += (sum >> 16);			/* add carry */
+    return (uint16_t)~sum;		/* truncate to 16 bits */
 }
 
 /**
  * Local Variables:
  *  indent-tabs-mode: t
- *  c-file-style: "ellemtel"
- *  c-basic-offset: 4
+ *  c-file-style: "cc-mode"
  * End:
  */

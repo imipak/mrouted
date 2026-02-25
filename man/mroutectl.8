@@ -1,4 +1,4 @@
-.Dd Mar 28, 2019
+.Dd Jan 1, 2021
 .Dt MROUTECTL 8 SMM
 .Os
 .Sh NAME
@@ -8,6 +8,8 @@
 .Sh SYNOPSIS
 .Nm mroutectl
 .Op Fl dpthv
+.Op Fl i Ar NAME
+.Op Fl u Ar FILE
 .Op COMMAND
 .Pp
 .Nm
@@ -49,10 +51,21 @@ options starting with two dashes (`-').  The options are as follows:
 Detailed output, where applicable, see each command below.
 .It Fl h, -help
 Show usage instructions and exit.
+.It Fl i, -ident Ar NAME
+Connect to named
+.Nm mrouted
+instance.
 .It Fl p, -plain
-Use plain table headings, no ANSI ctrl characters.
+Use plain table headings, no ANSI ctrl characters.  When using
+.Xr watch 1 ,
+use
+.Cm watch Fl c
+option instead, it handles ANSI escape sequences.
 .It Fl t, -no-heading
 Skip table headings altogether.
+.It Fl u, -ipc Ar FILE
+Override UNIX domain socket filename, the default on most systems is
+.Pa /var/run/mrouted.sock .
 .It Fl v, -version
 Show
 .Nm mrouted
@@ -112,8 +125,6 @@ Multicast traceroute information
 Debug IGMP, including DVMRP, messages
 .It Cm icmp
 Debug ICMP messages
-.It Cm rsrr
-Debug RSRR messages
 .It Cm all | 3
 Enable all subsystems (may trigger log rate limiter)
 .El
@@ -405,4 +416,5 @@ socket used for communication with
 .Xr mrouted.conf 5
 .Sh AUTHORS
 .Nm
-was written by Joachim Nilsson.
+was written by
+.An Joachim Wiberg Aq mailto:troglobit@gmail.com .

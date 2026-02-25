@@ -1,6 +1,8 @@
 [Unit]
 Description=Multicast routing daemon, mrouted
 Documentation=man:mrouted
+Documentation=man:mrouted.conf
+Documentation=man:mroutectl
 Documentation=file:@DOCDIR@/README.md
 Documentation=https://github.com/troglobit/mrouted
 # ConditionPathExists=@SYSCONFDIR@/mrouted.conf
@@ -10,7 +12,8 @@ Requires=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/sbin/modprobe ipip
-ExecStart=@SBINDIR@/mrouted -ns
+EnvironmentFile=-@SYSCONFDIR@/default/mrouted
+ExecStart=@SBINDIR@/mrouted --foreground --syslog $MROUTED_OPTS $MROUTED_ARGS
 
 [Install]
 WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Joachim Nilsson <troglobit@gmail.com>
+ * Copyright (c) 2018-2020  Joachim Wiberg <troglobit@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -35,10 +35,10 @@
 #include <sys/un.h>
 
 #include "defs.h"
-extern struct rtentry *routing_table;
 
 static struct sockaddr_un sun;
 static int ipc_socket = -1;
+static int sock_id;
 
 static int ipc_write(int sd, struct ipc *msg)
 {
@@ -121,7 +121,7 @@ static char *vif2name(int vif)
 	struct uvif *uv;
 	vifi_t vifi;
 
-	for (vifi = 0, uv = uvifs; vifi < numvifs; vifi++, uv++) {
+	UVIF_FOREACH(vifi, uv) {
 		if (vif == vifi)
 			return uv->uv_name;
 	}
@@ -143,7 +143,7 @@ static const char *ifstate(struct uvif *uv)
 static void show_iface(FILE *fp, int detail)
 {
 	struct listaddr *al;
-	struct uvif *v;
+	struct uvif *uv;
 	vifi_t vifi;
 	time_t thyme = time(NULL);
 
@@ -154,15 +154,15 @@ static void show_iface(FILE *fp, int detail)
 	fprintf(fp, "%-15s %-15s %5s %4s %3s%10s %-5s=\n",
 		"Address", "Interface", "State", "Cost", "TTL", "Uptime", "Flags");
 
-	for (vifi = 0, v = uvifs; vifi < numvifs; vifi++, v++) {
+	UVIF_FOREACH(vifi, uv) {
 		fprintf(fp, "%-15s %-15s %5s %4u %3u%10s %s\n",
-			inet_fmt(v->uv_lcl_addr, s1, sizeof(s1)),
-			v->uv_name,
-			ifstate(v),
-			v->uv_metric,
-			v->uv_threshold, /* TTL scoping */
-			"0:00:00",	 /* XXX fixme */
-			vif_sflags(v->uv_flags));
+			inet_fmt(uv->uv_lcl_addr, s1, sizeof(s1)),
+			uv->uv_name,
+			ifstate(uv),
+			uv->uv_metric,
+			uv->uv_threshold, /* TTL scoping */
+			"0:00:00",	  /* XXX fixme */
+			vif_sflags(uv->uv_flags));
 	}
 }
 
@@ -176,13 +176,13 @@ static void show_neighbor_header(FILE *fp, int detail)
 static void show_neighbor(FILE *fp, int detail)
 {
 	struct listaddr *al;
-	struct uvif *v;
+	struct uvif *uv;
 	vifi_t vifi;
 	time_t thyme = time(NULL);
 	int once = 1;
 
-	for (vifi = 0, v = uvifs; vifi < numvifs; vifi++, v++) {
-		for (al = v->uv_neighbors; al; al = al->al_next) {
+	UVIF_FOREACH(vifi, uv) {
+		TAILQ_FOREACH(al, &uv->uv_neighbors, al_link) {
 			char ver[10];
 
 			if (once) {
@@ -195,7 +195,7 @@ static void show_neighbor(FILE *fp, int detail)
 
 			fprintf(fp, "%-15s %-16s%-7s %-5s%10s %5us\n",
 				inet_fmt(al->al_addr, s1, sizeof(s1)),
-				v->uv_name,
+				uv->uv_name,
 				ver,
 				vif_nbr_sflags(al->al_flags),
 				scaletime(thyme - al->al_ctime),
@@ -218,14 +218,10 @@ static void show_routes_header(FILE *fp, int detail)
 
 static void show_routes(FILE *fp, int detail)
 {
-	struct rtentry *r;
-	vifi_t i;
+	struct rtentry *r = NULL;
 	int once = 1;
 
-	if (!routing_table)
-		return;
-
-	for (r = routing_table; r; r = r->rt_next) {
+	while (route_iter(&r)) {
 		if (once) {
 			show_routes_header(fp, detail);
 			once = 0;
@@ -246,7 +242,7 @@ static void show_routes(FILE *fp, int detail)
 		else
 			fprintf(fp, "  %4u ", r->rt_metric);
 
-		if (r->rt_timer == 0)
+		if (r->rt_gateway == 0)
 			fprintf(fp, "%8s", "Never");
 		else
 			fprintf(fp, "%7us", r->rt_timer);
@@ -272,11 +268,9 @@ static void show_mfc(FILE *fp, int detail)
 	struct rtentry *r;
 	struct gtable *gt;
 	struct stable *st;
-	struct ptable *pt;
 	time_t thyme = time(NULL);
 	vifi_t i;
 	char flags[5];
-	char c;
 	int once = 1;
 
 	for (gt = kernel_no_route; gt; gt = gt->gt_next) {
@@ -348,14 +342,18 @@ static void show_mfc(FILE *fp, int detail)
 		}
 
 		for (i = 0; i < numvifs; i++) {
+			struct uvif *uv = find_uvif(i);
+
 			if (VIFM_ISSET(i, gt->gt_grpmems))
 				fprintf(fp, "%s ", vif2name(i));
 			else if (VIFM_ISSET(i, r->rt_children) &&
-				 NBRM_ISSETMASK(uvifs[i].uv_nbrmap, r->rt_subordinates))
+				 NBRM_ISSETMASK(uv->uv_nbrmap, r->rt_subordinates))
 				fprintf(fp, "%s%s ", vif2name(i),
 					VIFM_ISSET(i, gt->gt_scope)
 					? ":b"
-					: (SUBS_ARE_PRUNED(r->rt_subordinates, uvifs[i].uv_nbrmap, gt->gt_prunes)
+					: (SUBS_ARE_PRUNED(r->rt_subordinates,
+							   uv->uv_nbrmap,
+							   gt->gt_prunes)
 					   ? ":p"
 					   : ":!"));
 		}
@@ -384,7 +382,7 @@ static void show_mfc(FILE *fp, int detail)
 				vif2name(r->rt_parent));
 
 			if (st->st_ctime) {
-				struct sioc_sg_req rq;
+				struct sioc_sg_req rq = { 0 };
 
 				fprintf(fp, "%10s ", scaletime(thyme - st->st_ctime));
 
@@ -411,6 +409,24 @@ static uint32_t diff_vtime(uint32_t mtime)
 	return virtual_time - mtime;
 }
 
+static char *group_flags(struct listaddr *al)
+{
+	static char flags[20];
+
+	memset(flags, 0, sizeof(flags));
+
+	if (al->al_pv < 3)
+		strlcat(flags, al->al_pv == 2 ? "v2" : "v1", sizeof(flags));
+
+	if (al->al_flags & NBRF_STATIC_GROUP) {
+		if (*flags)
+			strlcat(flags, " ", sizeof(flags));
+		strlcat(flags, "static", sizeof(flags));
+	}
+
+	return flags;
+}
+
 static void show_igmp_group(FILE *fp, int detail)
 {
 	struct listaddr *group, *source;
@@ -418,20 +434,28 @@ static void show_igmp_group(FILE *fp, int detail)
 	vifi_t vifi;
 	int once = 1;
 
-	for (vifi = 0, uv = uvifs; vifi < numvifs; vifi++, uv++) {
-		for (group = uv->uv_groups; group; group = group->al_next) {
+	UVIF_FOREACH(vifi, uv) {
+		TAILQ_FOREACH(group, &uv->uv_groups, al_link) {
+			char timeout[10];
+
 			if (once) {
 				fputs("IGMP Group Table_\n", fp);
-				fprintf(fp, "%-16s  %-15s  %-15s  %6s=\n",
-					"Interface", "Group", "Last Reporter", "Expire");
+				fprintf(fp, "%-16s  %-15s  %-15s  %6s  %-10s=\n",
+					"Interface", "Group", "Last Reporter", "Expire", "Flags");
 				once = 0;
 			}
 
-			fprintf(fp, "%-16s  %-15s  %-15s  %5us\n",
+			if (!group->al_timer)
+				snprintf(timeout, sizeof(timeout), "Never");
+			else
+				snprintf(timeout, sizeof(timeout), "%us",
+					 group->al_timer - diff_vtime(group->al_mtime));
+
+			fprintf(fp, "%-16s  %-15s  %-15s  %6s  %-10s\n",
 				uv->uv_name,
 				inet_fmt(group->al_addr, s1, sizeof(s1)),
 				inet_fmt(group->al_reporter, s2, sizeof(s2)),
-				group->al_timer - diff_vtime(group->al_mtime));
+				timeout, group_flags(group));
 		}
 	}
 }
@@ -450,7 +474,7 @@ static void show_igmp_iface(FILE *fp, int detail)
 	fprintf(fp, "%-16s  %-15s  %7s  %6s  %6s=\n",
 		"Interface", "Querier", "Version", "Groups", "Expire");
 
-	for (vifi = 0, uv = uvifs; vifi < numvifs; vifi++, uv++) {
+	UVIF_FOREACH(vifi, uv) {
 		size_t num = 0;
 		char timeout[10];
 		int version;
@@ -461,10 +485,10 @@ static void show_igmp_iface(FILE *fp, int detail)
 		} else {
 			inet_fmt(uv->uv_querier->al_addr, s1, sizeof(s1));
 			snprintf(timeout, sizeof(timeout), "%5us",
-				 IGMP_OTHER_QUERIER_PRESENT_INTERVAL - uv->uv_querier->al_timer);
+				 router_timeout - uv->uv_querier->al_timer);
 		}
 
-		for (group = uv->uv_groups; group; group = group->al_next)
+		TAILQ_FOREACH(group, &uv->uv_groups, al_link)
 			num++;
 
 		if (uv->uv_flags & VIFF_IGMPV1)
@@ -564,7 +588,7 @@ static int do_loglevel(void *arg)
 	return 0;
 }
 
-static void ipc_handle(int sd)
+static void ipc_handle(int sd, void *arg)
 {
 	socklen_t socklen = 0;
 	struct ipc msg;
@@ -645,7 +669,7 @@ static void ipc_handle(int sd)
 	close(client);
 }
 
-void ipc_init(void)
+void ipc_init(char *sockfile, char *ident)
 {
 	socklen_t len;
 	int sd;
@@ -660,7 +684,10 @@ void ipc_init(void)
 	sun.sun_len = 0;	/* <- correct length is set by the OS */
 #endif
 	sun.sun_family = AF_UNIX;
-	strlcpy(sun.sun_path, _PATH_MROUTED_SOCK, sizeof(sun.sun_path));
+	if (sockfile)
+		strlcpy(sun.sun_path, sockfile, sizeof(sun.sun_path));
+	else
+		snprintf(sun.sun_path, sizeof(sun.sun_path), _PATH_MROUTED_SOCK, ident);
 
 	unlink(sun.sun_path);
 	logit(LOG_DEBUG, 0, "Binding IPC socket to %s", sun.sun_path);
@@ -673,7 +700,8 @@ void ipc_init(void)
 		return;
 	}
 
-	if (register_input_handler(sd, ipc_handle) < 0)
+	sock_id = pev_sock_add(sd, ipc_handle, NULL);
+	if (sock_id < 0)
 		logit(LOG_ERR, 0, "Failed registering IPC handler");
 
 	ipc_socket = sd;
@@ -681,6 +709,8 @@ void ipc_init(void)
 
 void ipc_exit(void)
 {
+	if (sock_id > 0)
+		pev_sock_del(sock_id);
 	if (ipc_socket > -1)
 		close(ipc_socket);
 

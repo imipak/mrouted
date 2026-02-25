@@ -1,3 +1,137 @@
+mrouted (4.6) stable; urgency=low
+
+  * Issue #56: ensure group timers are stopped when stopping interfaces
+  * Issue #56: replace homegrown timer and socket handling with pev v2.0.
+    The existing timer implementation was too imprecise and jittered
+    several seconds between query intervals
+  * Issue #64: fix compiler warnings when building with 64-bit 'time_t'
+    targeting 32-bit platforms (only affects logging and status output)
+  * Fix 'mroutectl show routes', locally connected routes never expire
+  * Skip timeout of subordinates at startup
+  * Minor compiler warnings on non-Linux systems
+  * Check interface status and update internal state on more error
+    codes instead of logging 'sendto()' or 'sendmsg()' failure
+  * Revert change in 'TIMER_INTERVAL' from v4.0, update interval is
+    now 5 seconds instead of 2
+  * Removed internal log rate limiter, demystifies behavior and greatly
+    simplifies the code
+  * Log interface names with their assigned VIF number to ease debugging
+  * Speed up peering by sending route reports as soon as one-way peering
+    has been established
+  * Updates to logging, clarifying source 0.0.0.0 of routes as "us", and
+    add logging when adding and discarding groups to/from interfaces
+  * Use (S, G) format for all logging
+  * Silence bogus 'Failed MRT_DEL_MFC' warnings for routes never added to
+    the MRIB due to missing reverse path
+  * Drop lsb-base dependency for mrouted package.  To use init script on
+    non-systemd setups, install sysvinit-utils
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Sun, 10 Nov 2024 09:01:00 +0100
+
+mrouted (4.5) stable; urgency=low
+
+  * Ignore IGMP proxy querys (src ip: 0.0.0.0), they must never win
+    a querier election.
+  * Add support for configurable IGMP query response interval
+  * Add support for configurable IGMP querier timeout
+  * ADd support for explicit group memberships, using a new
+    phyint keyword 'join-group <GROUP>'.  Forces an IGMPv2 join
+    on the given interface.  Never expires
+  * On startup and reconf, log why we skip disabled interfaces
+  * Change to always log when assuming the IGMP querier role
+  * Fix compat read location and new location for `mrouted.genid`
+  * Fix "non-decreasing" generation id, must increment on each restart
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Sun, 04 Jun 2023 17:05:48 +0200
+
+mrouted (4.4) stable; urgency=low
+
+  * Issue #52: fix IPIP tunnels, both configuration and an off-by-one
+    problem in unicast route distribution.
+  * Fix 10 year old regression causing off-by-one (loss of one) in unicast
+    route distribution (built-in RIP)  -- root cause for issue #52
+  * Warn if installing tunnel vifs fail, probably missing ipip.ko
+  * Logging to stdout now always prefix messages with daemon identity
+  * Renamed tunnel vifs to match kernel names -> dvmrpN
+  * Dropped RSRR feature (never enabled in Debian packages)
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Wed, 03 Nov 2021 11:54:42 +0100
+
+mrouted (4.3) stable; urgency=low
+  * Add support for -i,--ident=NAME` to change identity of an instance
+  * Add support for -p,--pidfile=FILE to override default PID file
+  * Touch PID file at SIGHUP to acknowledge done reloading .conf file
+  * Add support for -t,--table-id=ID, multicast routing tables
+  * Add support for -u,--ipc=FILE to override /var/run/mrouted.sock file
+  * Fix segfault when parsing phyint lines in .conf file interface
+    cannot be found, e.g., phyint eth1 static-group 225.1.2.5
+  * Prevent cascading warnings when phyint interface names cannot be found
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Sun, 19 Sep 2021 01:06:37 +0200
+
+mrouted (4.2) stable; urgency=medium
+
+  * Support for controlling IGMP Last Member Query Count using the
+    igmp-robustness setting in mrouted.conf, default 2
+  * Support for tuning the IGMP Last Member Query Interval using a
+    new setting igmp-query-last-member-interval <1-1024>
+  * Support for static multicast routing, similar to SMCRoute, using a new
+    phyint keyword 'static-group GROUP'.  Works as if an IGMPv2 join was
+    received on the given interface.  Never expires
+  * IGMPv3 membership reports were parsed incorrectly.  The problem affects
+    users that use source specific multicast join, i.e., (S,G) join/leave
+    using IGMPv3.  Support for IGMPv3 was introduced in mrouted v4.0
+  * Proper tracking of lower-version IGMP hosts.  When a lower-version host
+    joins a group no higer-version IGMP is allowed, e.g., IGMPv2 LEAVE is
+    ignored if a group is in IGMPv1 compat mode
+  * Allow IGMP reports from source address 0.0.0.0, for compliance with
+    RFC3376.  Should improve interop with IGMP snooping switches and any
+    DHCP client that has not yet received a lease
+  * Issue #46: Malformed group-specific IGMP query.  The IGMP header no
+    longer had the group field set, despite the query being addressed to a
+    specific group.  Regression introduced in v4.0
+  * Issue #47: parser did not allow the (optional) phyint keyword 'igmpv3'
+  * Improved support for running mroutectl under watch(1).  No more
+    artifacts due to unknown ANSI escape sequences to probe width
+  * Delayed PID file creation until after initial startup delay, there
+    is nobody home until after that delay, so no point in announcing
+    availability until after that
+  * Fix buffer overrun in descriptor `poll()` handling
+  * Fix double-close on SIGHUP, Linux systems only
+  * Various non-critical memory leak fixes, critical for no-MMU systems
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Thu, 07 Jan 2021 04:57:48 +0100
+
+mrouted (4.1) stable; urgency=medium
+
+  * Update maintainer last name
+  * Refactor interface probing to fix `no phyint` on systems with
+    many interfaces.  Now possible to use only a select few phyints
+  * Support for automatically adding secondary IP addresses as altnet
+  * Improve error message, and document in mrouted(8), common startup
+    problems, e.g., running out of IGMP groups on Linux
+  * Improve error message when receiving multicast on unknown vifs
+  * Massive update of mrouted.conf(5), lots of options missing:
+    * prune-lifetime
+    * rexmit-prunes
+    * phyint and tunnel interface flags:
+      * advert-metric
+      * allow-nonpruners
+      * blaster
+      * force-leaf
+      * noflood
+      * passive
+      * prune-lifetime
+       rexmit-prunes
+    * The tunnel option beside off
+    * Route filtering options with accept, deny, and notransit
+  * Fixes to update of mrouted.genid file
+  * Fix location of mrouted.genid, should be in /var/lib/misc
+  * Fix annoying message "cCannot disable multicast routing" at startup
+  * Fix double free in PID file code
+
+ -- Joachim Wiberg <troglobit@gmail.com>  Fri, 02 Oct 2020 05:19:06 +0200
+
 mrouted (4.0) unstable; urgency=medium
 
   * New upstream release with support for IGMP v3 and a new mroutectl tool.
